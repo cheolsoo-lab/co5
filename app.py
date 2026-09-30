@@ -1,5 +1,5 @@
 """
-app.py — 심신안정 웹 화면 (핸드폰 우선)
+app.py — 코인 추천 웹 화면 (핸드폰 우선)
 실행:  streamlit run app.py
 배포:  README.md 참고 (Streamlit Community Cloud 또는 본인 PC/서버)
 
@@ -19,7 +19,7 @@ import streamlit as st
 import app_logic as L
 import crypto_market_regime as cmr
 
-st.set_page_config(page_title="심신안정", page_icon="📈", layout="centered",
+st.set_page_config(page_title="코인 추천", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
 st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 
@@ -28,7 +28,7 @@ st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 def get_store() -> dict:
     """모든 접속(폰/PC)이 분석 결과를 공유 → 접속할 때마다 새로 스캔하지 않음."""
     return {"lock": threading.Lock(), "result": None, "log": "", "error": None, "scan_cfg": None,
-            "live_at": None, "live_log": ""}
+            "live_at": None, "live_log": "", "bt": None, "bt_error": None}
 
 
 store = get_store()
@@ -38,7 +38,7 @@ def kst(ts) -> str:
     return (pd.Timestamp(ts) + pd.Timedelta(hours=9)).strftime("%H:%M")
 
 
-st.title("📈 심신안정")
+st.title("📈 코인 추천")
 st.caption("Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님)")
 
 # ---------------------------------------------------------------- 설정
@@ -65,6 +65,78 @@ tf = "1h" if tf_choice.startswith("1") else "4h"
 risk_cfg = cmr.RiskConfig(account_balance=balance, risk_per_trade_pct=risk_pct, max_concurrent_setups=max_n,
                           max_total_risk_pct=max_total, open_positions=int(open_pos))
 scan_cfg = (top_n, bitget_only, tf)
+
+
+# ---------------------------------------------------------------- 과거 검증 화면
+def render_backtest() -> None:
+    st.caption("실제 과거 데이터로 지금 전략을 그대로 돌려봐요. 과거에 좋았다고 미래가 보장되진 않아요.")
+    b1, b2 = st.columns(2)
+    n_coins = b1.slider("검증할 코인 수", 5, 30, 15, key="bt_n")
+    period = b2.selectbox("기간", ["6개월", "1년", "2년"], index=1, key="bt_period")
+    days = {"6개월": 182, "1년": 365, "2년": 730}[period]
+    est_min = max(1, round(n_coins * (9 if tf == "4h" else 30) * days / 365 / 60))
+    st.caption(f"{cmr.tf_label(tf)} 기준 · 예상 소요 약 {est_min}분(데이터 받는 시간 포함 더 걸릴 수 있음) · "
+               "거래가 100건 이상이어야 믿을 만해요")
+    if st.button("▶ 검증 실행", type="primary", use_container_width=True):
+        prog = st.progress(0.0, text="과거 데이터 받는 중...")
+
+        def cb(i: int, n: int, sym: str) -> None:
+            prog.progress(min(i / max(n, 1), 1.0), text=f"검증 중 {i}/{n}  {sym}")
+
+        with store["lock"]:
+            cmr.BITGET_ONLY = bitget_only
+            cmr.set_timeframe(tf)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    store["bt"] = cmr.run_backtest_suite(n_coins, days, cb)
+                store["bt_error"] = None
+            except Exception:
+                store["bt_error"] = traceback.format_exc() + "\n" + buf.getvalue()
+            finally:  # 추천 화면이 쓰는 봉 모드로 되돌림
+                r0 = store["result"]
+                cmr.set_timeframe(r0.get("timeframe", "4h") if r0 else "4h")
+        prog.empty()
+
+    if store.get("bt_error"):
+        st.error("검증 중 오류가 발생했어요. 아래 내용을 그대로 복사해서 알려주세요.")
+        st.code(store["bt_error"], language=None)
+    bt = store.get("bt")
+    if not bt:
+        st.info("아직 실행한 검증이 없어요. 코인 수와 기간을 고르고 '▶ 검증 실행'을 눌러주세요.")
+        return
+
+    st.caption(f"{bt['exchange']} · {cmr.tf_label(bt['timeframe'])} · "
+               f"{pd.Timestamp(bt['start']):%Y-%m-%d} ~ {pd.Timestamp(bt['end']):%Y-%m-%d} · "
+               f"코인 {len(bt['coins'])}개 · 실행 {kst(bt['ran_at'])}")
+    st.dataframe(cmr.backtest_mode_table(bt), hide_index=True, use_container_width=True)
+    lines = cmr.interpret_backtest(cmr.summarize_trades(bt["trades"]["partial_trail"]), risk_pct)
+    cmp_line = cmr.compare_modes_line(bt)
+    st.markdown("\n".join(f"- {x}" for x in lines + ([cmp_line] if cmp_line else [])))
+
+    t1, t2, t3 = st.tabs(["방향·유형별", "코인별", "📋 복사용"])
+    tr = bt["trades"]["partial_trail"]
+    with t1:
+        st.caption("분할익절+추적손절 기준")
+        st.dataframe(cmr.backtest_group_table(tr, "direction"), hide_index=True, use_container_width=True)
+        st.dataframe(cmr.backtest_group_table(tr, "family"), hide_index=True, use_container_width=True)
+    with t2:
+        st.caption("분할익절+추적손절 기준 · 합계 R 순")
+        st.dataframe(cmr.backtest_group_table(tr, "symbol"), hide_index=True, use_container_width=True)
+    with t3:
+        st.caption("이 내용을 복사해서 보내주시면 결과를 해석하고 기준을 조정해 드릴게요.")
+        st.code(cmr.backtest_report_text(bt, risk_pct), language=None)
+    if bt["errors"]:
+        st.caption("제외된 코인: " + " · ".join(bt["errors"][:10]))
+    st.caption("ⓘ 스프레드·펀딩비·거래대금 필터는 과거 기록이 없어 검증에 반영되지 않았어요. "
+               "그리고 이 결과에 맞춰 기준을 여러 번 바꾸면 과거에만 맞는 전략이 되기 쉬우니, "
+               "기준을 바꿨다면 다른 기간(예: 6개월 → 2년)으로 다시 확인하세요.")
+
+
+page = st.radio("화면", ["📋 추천", "🧪 과거 검증"], horizontal=True, key="page", label_visibility="collapsed")
+if page.endswith("과거 검증"):
+    render_backtest()
+    st.stop()
 
 
 def run_scan(force: bool) -> None:

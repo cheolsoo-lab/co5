@@ -1791,6 +1791,52 @@ def run_backtest_suite(n_coins: int = 15, days: int = 365, progress_cb=None) -> 
             "end": btc["ts"].iloc[-1], "ran_at": utc_now()}
 
 
+EXIT_MODE_LABEL = {"partial_trail": "분할익절+추적손절", "fixed": "목표1 전량"}
+
+
+def backtest_mode_table(bt: Dict) -> pd.DataFrame:
+    """청산 방식별 핵심 지표 표."""
+    rows = []
+    for mode, name in EXIT_MODE_LABEL.items():
+        sm = summarize_trades(bt["trades"][mode])
+        if sm["n"] == 0:
+            rows.append({"청산 방식": name, "거래 수": 0}); continue
+        rows.append({"청산 방식": name, "거래 수": sm["n"], "승률": f"{sm['win_rate']:.0%}",
+                     "평균 R": f"{sm['avg_R']:+.2f}", "PF": f"{sm['pf']:.2f}", "합계 R": f"{sm['total_R']:+.1f}",
+                     "최대 연속 손실": sm["max_consec_loss"], "최대 낙폭(R)": f"{sm['max_dd_R']:.1f}",
+                     "전반/후반 R": f"{sm['first_half_avg']:+.2f} / {sm['second_half_avg']:+.2f}"})
+    return pd.DataFrame(rows)
+
+
+def backtest_group_table(trades: List[Dict], by: str) -> pd.DataFrame:
+    """by: 'direction'(롱/숏) · 'family'(추세/돌파/박스 역매매) · 'symbol'(코인별)."""
+    groups: Dict[str, List[Dict]] = {}
+    for x in trades:
+        if by == "direction":
+            g = "롱" if x["direction"] == "long" else "숏"
+        elif by == "family":
+            g = SETUP_FAMILY.get(x["bias"], x["bias"])
+        else:
+            g = x.get("symbol", "?")
+        groups.setdefault(g, []).append(x)
+    rows = []
+    for g, v in groups.items():
+        sm = summarize_trades(v)
+        rows.append({"구분": g, "거래 수": sm["n"], "승률": f"{sm['win_rate']:.0%}", "평균 R": round(sm["avg_R"], 2),
+                     "합계 R": round(sm["total_R"], 1)})
+    out = pd.DataFrame(rows)
+    return out.sort_values("합계 R", ascending=False).reset_index(drop=True) if len(out) else out
+
+
+def compare_modes_line(bt: Dict) -> str:
+    a, b = summarize_trades(bt["trades"]["partial_trail"]), summarize_trades(bt["trades"]["fixed"])
+    if not a.get("n") or not b.get("n"):
+        return ""
+    better = "분할익절+추적손절" if a["avg_R"] > b["avg_R"] else "목표1 전량"
+    return (f"⚖️ 청산 방식 비교: 분할익절+추적손절 {a['avg_R']:+.2f}R vs 목표1 전량 {b['avg_R']:+.2f}R "
+            f"→ 이 기간에는 '{better}' 쪽이 나았어요.")
+
+
 def backtest_report_text(bt: Dict, risk_pct: float = 1.0) -> str:
     """결과를 복사해서 보내기 좋은 텍스트로."""
     lines = [f"[과거 검증] {bt['exchange']} · {tf_label(bt['timeframe'])} · {bt['days']}일 · 코인 {len(bt['coins'])}개",
