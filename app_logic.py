@@ -25,6 +25,8 @@ BIAS_INFO = {
     "wait_breakout_short": ("short", "숏", "박스 하단 이탈 후 리테스트"),
     "range_fade_long": ("long", "롱", "박스 하단 반등(평균회귀)"),
     "range_fade_short": ("short", "숏", "박스 상단 저항(평균회귀)"),
+    "donchian_long": ("long", "롱", "신고점 돌파(약 20일) · 시장가"),
+    "donchian_short": ("short", "숏", "신저점 이탈(약 20일) · 시장가"),
 }
 
 CSS = """
@@ -74,7 +76,10 @@ CSS = """
 .over{margin-top:6px;font-size:.78rem;color:#dc2626;font-weight:650}
 .perp{margin-top:4px;font-size:.78rem;background:rgba(245,158,11,.15);border-radius:8px;padding:4px 8px}
 .tag.ct{background:rgba(147,51,234,.18)}
+.tag.lab{background:rgba(59,130,246,.16)}
 .dead{font-size:.85rem;padding:6px 2px;border-bottom:1px solid rgba(128,128,128,.2)}
+.watch{font-size:.86rem;padding:7px 2px;border-bottom:1px solid rgba(128,128,128,.2);line-height:1.5}
+.hot{margin-top:3px;font-size:.78rem;color:#dc2626;font-weight:650}
 """
 
 
@@ -115,11 +120,13 @@ def side_info(bias: str) -> Tuple[str, str, str]:
 
 
 def sort_key(setup) -> Tuple[float, float]:
-    """롱은 상대강도가 클수록, 숏은 작을수록(더 약할수록) 위로. 동률이면 비대칭 점수."""
-    asym = setup.asymmetry if setup.asymmetry is not None else 0.0
-    if side_info(setup.bias)[0] == "long":
-        return (setup.rs, asym)
-    return (-setup.rs, -asym)
+    """정렬: 연구실에서 '우선순위'로 통과한 표시가 많은 신호 먼저 → 알트 지수 대비 상대강도(없으면 BTC 대비).
+    롱은 강할수록, 숏은 약할수록 위로."""
+    from crypto_market_regime import PRIORITY_TAGS  # 지연 임포트
+    pri = sum(t in PRIORITY_TAGS for t in (getattr(setup, "tags", None) or []))
+    rs_alt = getattr(setup, "rs_alt", None)
+    strength = rs_alt if rs_alt is not None else setup.rs
+    return (pri, strength if side_info(setup.bias)[0] == "long" else -strength)
 
 
 STATUS_INFO = {
@@ -139,6 +146,12 @@ def exit_plan_text(setup, scale: float = 1.0) -> str:
     return f"목표1에서 {pct}% 익절 → 남은 물량 손절을 진입가로 → 이후 {anchor}에서 {trail} 되돌리면 정리"
 
 
+def entry_label(setup) -> str:
+    """신고점 돌파·즉시 진입은 시장가, 나머지는 지정가."""
+    market = setup.bias.startswith("donchian") or "즉시 진입" in (setup.entry_note or "")
+    return "진입(시장가)" if market else "진입(지정가)"
+
+
 def perp_name(setup) -> str:
     ps = getattr(setup, "perp_symbol", "") or ""
     return (ps.split(":")[0] if ps else setup.symbol).replace("/", "")
@@ -150,7 +163,7 @@ def order_memo(setup, sizing: Dict, lev: int) -> str:
     m = int(getattr(setup, "perp_mult", 1) or 1)
     lines = [
         f"{perp_name(setup)}  {side_kr} ({sub})",
-        f"진입(지정가): {fmt_price(setup.entry_price * m)}",
+        f"{entry_label(setup)}: {fmt_price(setup.entry_price * m)}",
         f"손절: {fmt_price(setup.sl * m)}",
         f"목표1: {fmt_price(setup.tp1 * m)}  /  목표2(참고): {fmt_price(setup.tp2 * m)}",
         f"청산: {exit_plan_text(setup, m)}",
@@ -160,6 +173,48 @@ def order_memo(setup, sizing: Dict, lev: int) -> str:
     if m > 1:
         lines.append(f"※ Bitget 선물은 {m:,}배 단위 표기라 가격은 ×{m:,}, 수량은 ÷{m:,} 해서 적었어요")
     return "\n".join(lines)
+
+
+def watch_line(w: Dict) -> str:
+    """돌파 임박 관찰 목록 한 줄. 선물이 1000배 표기면 가격도 선물 기준으로 환산."""
+    m = int(w.get("perp_mult", 1) or 1)
+    name = (w.get("perp_symbol") or w["symbol"]).split(":")[0].replace("/", "")
+    long_side = w["side"] == "long"
+    what = "⬆ 상단 돌파 대기 (롱)" if long_side else "⬇ 하단 이탈 대기 (숏)"
+    vol = w.get("vol_ratio")
+    vol_txt = f" · 거래량 {vol:.1f}배" + (" ↑" if vol and vol >= 1.2 else "") if vol else ""
+    hot = ('<div class="hot">🔥 지금 경계를 넘는 중 — 이 봉이 경계 밖에서 마감하면(거래량 1.5배 이상) 추천으로 올라와요</div>'
+           if w.get("crossing") else "")
+    return (f'<div class="watch"><b>{html.escape(name)}</b> {what}<br>'
+            f'<span class="k">경계 {fmt_price(w["trigger"] * m)} · 현재가 {fmt_price(w["price"] * m)} · '
+            f'남은 거리 {w["dist_atr"]:.1f} ATR{vol_txt} · 박스 {html.escape(w.get("touches", ""))}</span>{hot}</div>')
+
+
+def paused_line(setup) -> str:
+    """자동 중지된 신호 한 줄 (참고용)."""
+    side, side_kr, sub = side_info(setup.bias)
+    return (f'<div class="dead"><b>{html.escape(setup.symbol)}</b> {side_kr} · {html.escape(sub)} '
+            f'<span class="k">(진입 {fmt_price(setup.entry_price)} · 손절 {fmt_price(setup.sl)})</span></div>')
+
+
+PORT_ICON = {"신규 진입": "🟢", "비중 조정": "🔄", "정리": "🔴", "유지": "⚪"}
+
+
+def portfolio_line(r: Dict) -> str:
+    """추세 포트폴리오 한 줄. 선물이 1000배 표기면 가격을 선물 기준으로 환산."""
+    m = int(r.get("perp_mult", 1) or 1)
+    name = (r.get("perp_symbol") or r["symbol"]).split(":")[0].replace("/", "")
+    if r["status"] == "정리":
+        why = f" — {html.escape(r['reason'])}" if r.get("reason") else ""
+        body = f"전량 정리 (어제 비중 {r['prev_weight']:.0%}){why}"
+    elif r["status"] == "비중 조정":
+        body = f"비중 {r['prev_weight']:.0%} → <b>{r['weight']:.0%}</b> (명목 ${fmt_money(r['notional'])})"
+    else:
+        body = f"목표 비중 <b>{r['weight']:.0%}</b> (명목 ${fmt_money(r['notional'])})"
+    return (f'<div class="watch">{PORT_ICON.get(r["status"], "")} <b>{html.escape(name)}</b> {r["status"]} · {body}<br>'
+            f'<span class="k">종가 {fmt_price(r["close"] * m)} · 50일선 {fmt_price(r["exit_line"] * m)}'
+            f'{" · 30일 수익률 " + format(r["ret30"], "+.1%") if r.get("ret30") is not None else ""}'
+            f'{" · 선물 ×" + format(m, ",") + " 표기" if m > 1 else ""}</span></div>')
 
 
 def dead_line(setup) -> str:
@@ -183,9 +238,13 @@ def card_html(setup, sizing: Dict, risk_pct: float, over_limit: bool = False) ->
         tags += '<span class="tag ct">↔ 시장 역행</span>'
     status = getattr(setup, "live_status", "") or ("chase" if setup.is_chase else "ready")
     s_icon, s_label = STATUS_INFO.get(status, ("", ""))
-    stats = f"상대강도 {setup.rs:+.1f}%"
-    if setup.asymmetry is not None:
-        stats += f" · 비대칭 {setup.asymmetry:+.2f}"
+    from crypto_market_regime import TAG_LABELS, PRIORITY_TAGS  # 지연 임포트
+    for t in getattr(setup, "tags", None) or []:
+        star = "⭐ " if t in PRIORITY_TAGS else ""
+        tags += f'<span class="tag lab">{star}{e(TAG_LABELS.get(t, t))}</span>'
+    stats = f"BTC 대비 {setup.rs:+.1f}%"
+    if getattr(setup, "rs_alt", None) is not None:
+        stats += f" · 알트 대비 {setup.rs_alt:+.1f}%"
     warn = ""
     if status == "chase" and setup.entry_price:
         gap = (setup.current_price - setup.entry_price) / setup.entry_price * 100
@@ -197,7 +256,7 @@ def card_html(setup, sizing: Dict, risk_pct: float, over_limit: bool = False) ->
 
     grid = "".join([
         cell("현재가", fmt_price(setup.current_price)),
-        cell("진입(지정가)", fmt_price(setup.entry_price)),
+        cell(entry_label(setup), fmt_price(setup.entry_price)),
         cell("손절", fmt_price(setup.sl), "sl"),
         cell("목표1", fmt_price(setup.tp1), "tp"),
         cell("목표2(참고)", fmt_price(setup.tp2), "tp"),
@@ -211,7 +270,10 @@ def card_html(setup, sizing: Dict, risk_pct: float, over_limit: bool = False) ->
     perp_note = (f'<div class="perp">Bitget 선물 표기 <b>{e(perp_name(setup))}</b> — 선물 주문 가격은 아래 값 ×{m:,} '
                  f'(주문 메모에는 환산해서 적었어요)</div>') if m > 1 else ""
     if over_limit:
-        warn += '<div class="over">⛔ 총 리스크 상한 초과 — 지금은 참고만 (보유 포지션이 정리되면 검토)</div>' 
+        warn += '<div class="over">⛔ 총 리스크 상한 초과 — 지금은 참고만 (보유 포지션이 정리되면 검토)</div>'
+    if getattr(setup, "health", "") == "caution":
+        warn += ('<div class="over">🛡 자동 방어: 이 신호 유형의 최근 실전 성과가 기준 아래라 '
+                 '권장 리스크를 절반으로 낮춰 수량을 계산했어요</div>')
     return (f'<div class="cc {side}">'
             f'<div class="cc-head"><span class="pill {side}">{side.upper()} {e(side_kr)}</span>'
             f'<span class="sym">{e(setup.symbol)}</span>{tags}</div>'

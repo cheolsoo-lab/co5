@@ -40,10 +40,14 @@ except ImportError:
 # 0. 설정
 # --------------------------------------------------------------------------
 
-APP_VERSION = "2026-09-30 v5"                     # 화면·검증 결과에 표시 — 새 파일이 반영됐는지 확인용
+APP_VERSION = "2026-09-30 v11"                     # 화면·검증 결과에 표시 — 새 파일이 반영됐는지 확인용
 EXCHANGES = ["bitget", "okx", "binance"]          # 앞쪽일수록 우선 사용(Bitget = 실제 거래 거래소). 일부 거래소는 서버 지역에 따라 차단될 수 있음
 QUOTE = "USDT"
-TOP_N_BY_VOLUME = 30                              # 스캔 코인 수 = 3개 거래소 합산 거래량 순위 상위 N개 (검증된 범위에 맞춤)
+TOP_N_BY_VOLUME = 60                              # 스캔 코인 수 = 3개 거래소 합산 거래량 순위 상위 N개 (검증에서 60위까지 플러스)
+TRACK_FILE = "signal_tracking.json"               # 실전 추천 자동 추적 기록
+LAB_REF_FILE = "lab_reference.json"               # 자동 방어 기준선(연구실 실행 때마다 신호 유형별 과거 성과 저장)
+AUTO_DEFENSE = True                               # 실전 성과가 기준선 아래로 떨어진 신호 유형을 자동 감축·중지
+FALLBACK_LOW_R = -0.3                             # 연구실 기준선이 없을 때 쓰는 보수적 고정 기준(최근 평균 R)
 ENABLED_FAMILIES = {"돌파"}                        # 추천할 신호 유형 (2년 검증에서 돌파만 뚜렷한 플러스)
 TIMEFRAME = "4h"                                  # 스윙 트레이딩 기준 봉
 OHLCV_LIMIT = 600                                 # 4h 캔들 개수 (EMA200이 제대로 계산되려면 수백 개 필요 — 200개면 첫 봉 비중이 13%나 남음)
@@ -56,7 +60,24 @@ MIN_STOP_ATR = 1.0                                # 손절폭 최소값 — 너�
 CHASE_ATR = 0.5                                   # 현재가가 진입가에서 이만큼(ATR 배수) 넘게 벗어나면 '추격 구간'
 PARTIAL_TP_FRACTION = 0.5                         # 청산: 목표1에서 이 비율만큼 익절
 TRAIL_ATR = 2.5                                   # 청산: 나머지는 최고가(롱)/최저가(숏)에서 이만큼 떨어지면 정리(추적 손절)
-LONG_BIASES = ("long", "wait_breakout_long", "range_fade_long")
+LONG_BIASES = ("long", "wait_breakout_long", "range_fade_long", "donchian_long")
+
+# 거래 비용 (Bitget USDT-M 선물 일반 등급 기준. 등급이 다르면 여기서 바꾸세요)
+MAKER_FEE_PCT = 0.02                              # 지정가 진입·목표1 지정가 익절
+TAKER_FEE_PCT = 0.06                              # 시장가 진입·손절·추적손절
+SLIPPAGE_BY_TIER = {"거래량 1~30위": 0.03, "거래량 31~60위": 0.05, "거래량 61~100위": 0.08}
+DEFAULT_SLIPPAGE_PCT = 0.05                       # 시장가 체결 시 슬리피지(%), 거래량 작을수록 큼
+
+# 신고점 돌파(돈치안): 직전 N봉 최고가를 종가로 넘으면 시장가 진입. N은 약 20일
+DONCHIAN_N = {"4h": 120, "1h": 480}
+
+# 전략 연구실에서 '통과'한 항목을 실전 추천에 반영하는 설정 (앱의 '이 설정 적용' 버튼이 바꿈)
+BREAKOUT_ENTRY = "retest"                         # retest(리테스트 지정가 대기) | immediate(돌파 즉시 진입)
+PRIORITY_TAGS: set = set()                        # 이 표시가 붙은 신호를 먼저 보여줌
+FILTER_TAGS: set = set()                          # 이 표시가 모두 붙은 돌파 신호만 추천
+LAB_CONFIG_FILE = "lab_config.json"
+TAG_LABELS = {"squeeze": "변동성 수축", "htf_align": "일봉 방향 일치", "alt_strong": "알트 지수 대비 강함",
+              "btc_strong": "BTC 대비 강함", "strong_close": "강한 마감"}
 
 # 신호 봉 모드. 1시간봉은 '비교용' — 상대강도 기간은 시간으로 환산(≈1·2·4주 유지), 상위추세는 4시간봉.
 # 나머지 기준(박스 60봉, 임펄스 30봉 등)은 봉 개수 그대로라 기간이 4분의 1로 짧아지는 '더 빠른 전략'이 됩니다.
@@ -137,9 +158,9 @@ def cap_correlated_exposure(setups: List["CoinSetup"], risk_cfg: RiskConfig,
     def _short_rank(s):
         return (-s.rs, -(s.asymmetry if s.asymmetry is not None else 0.0), s.rr_ratio)
 
-    long_like = sorted([s for s in setups if s.bias in ("long", "wait_breakout_long", "range_fade_long")],
+    long_like = sorted([s for s in setups if s.bias in LONG_BIASES],
                         key=_long_rank, reverse=True)[:risk_cfg.max_concurrent_setups]
-    short_like = sorted([s for s in setups if s.bias in ("short", "wait_breakout_short", "range_fade_short")],
+    short_like = sorted([s for s in setups if s.bias not in LONG_BIASES],
                          key=_short_rank, reverse=True)[:risk_cfg.max_concurrent_setups]
 
     for group, label in [(long_like, "롱"), (short_like, "숏")]:
@@ -693,7 +714,7 @@ class CoinSetup:
     symbol: str
     exchange: str
     bias: Literal["long", "short", "wait_breakout_long", "wait_breakout_short",
-                  "range_fade_long", "range_fade_short"]
+                  "range_fade_long", "range_fade_short", "donchian_long", "donchian_short"]
     entry_note: str
     entry_price: float   # 추격이 아닌, 되돌림 지정가(limit) 진입가
     current_price: float # 참고용 현재가 (추격 여부 비교용)
@@ -713,6 +734,12 @@ class CoinSetup:
     live_status: str = ""  # ready(진입가 근처) / chase(추격 구간) / invalid(손절선 먼저 이탈) / missed(목표 먼저 도달)
     perp_symbol: str = ""  # Bitget 선물 심볼 (예: 1000PEPE/USDT:USDT)
     perp_mult: int = 1     # 선물 가격 = 현물 가격 × perp_mult
+    rs_alt: Optional[float] = None  # 알트 지수 대비 상대강도(%) — 알트끼리 비교한 힘
+    tags: List[str] = field(default_factory=list)  # 돌파 신호의 보조 표시 (TAG_LABELS 참고)
+    signal_ts: str = ""        # 신호가 나온 완성봉 시각 (실전 추적용)
+    market_entry: bool = False  # 시장가 진입 신호(신고점 돌파·즉시 진입) 여부
+    health: str = ""            # 자동 방어 상태: "" 정상·판단 전 / caution 주의(리스크 절반) / paused 자동 중지
+    risk_mult: float = 1.0      # 권장 리스크 배수 (주의 상태면 0.5)
 
 
 def _volume_list(exchange_id: str, top_n: int) -> List[tuple]:
@@ -1106,7 +1133,8 @@ REJECT_LABELS = {
     "invalid_price": "이미 손절선을 넘음(무효)", "target_reached": "이미 목표가 도달(놓침)",
     "no_box": "유효한 박스 아님", "lean_against": "횡보 기울기와 반대", "mid_box": "박스 중간(관망)",
     "htf_against": "일봉 추세와 반대", "wide_spread": "스프레드 넓음", "funding_hot": "펀딩비 과열",
-    "low_rr": "손익비 부족", "family_off": "꺼둔 신호 유형",
+    "low_rr": "손익비 부족", "family_off": "꺼둔 신호 유형", "no_donchian": "신고점 돌파 없음",
+    "tag_filter": "필수 표시 없음(연구실 설정)",
 }
 
 
@@ -1136,9 +1164,99 @@ def _signal_time_problem(direction: str, price: float, sl: float, tp1: float) ->
     return None
 
 
+def breakout_tags(df: pd.DataFrame, direction: str, htf_trend: RegimeType,
+                  rs_alt: Optional[float], rs_btc: Optional[float]) -> List[str]:
+    """돌파 신호의 보조 표시. 진입 조건은 바꾸지 않고, 전략 연구실에서 '붙은 신호 vs 안 붙은 신호'를 비교하는 용도.
+    - squeeze: 돌파 직전 20봉 평균 변동폭이 100봉 평균의 80% 이하 (변동성이 눌렸다가 터짐)
+    - htf_align: 일봉(상위 봉) 추세와 같은 방향
+    - alt_strong / btc_strong: 알트 지수·BTC 대비 상대강도가 진입 방향과 일치
+    - strong_close: 돌파봉이 봉 범위 상단 25%(숏은 하단 25%)에서 마감"""
+    tags: List[str] = []
+    long_side = direction == "long"
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
+    if len(tr) >= 102:
+        a20, a100 = tr.iloc[-21:-1].mean(), tr.iloc[-101:-1].mean()
+        if a100 > 0 and a20 / a100 <= 0.8:
+            tags.append("squeeze")
+    if (long_side and htf_trend == "uptrend") or (not long_side and htf_trend == "downtrend"):
+        tags.append("htf_align")
+    if rs_alt is not None and ((long_side and rs_alt > 0) or (not long_side and rs_alt < 0)):
+        tags.append("alt_strong")
+    if rs_btc is not None and ((long_side and rs_btc > 0) or (not long_side and rs_btc < 0)):
+        tags.append("btc_strong")
+    last = df.iloc[-1]
+    rng = last["high"] - last["low"]
+    if rng > 0:
+        pos = (last["close"] - last["low"]) / rng
+        if (long_side and pos >= 0.75) or (not long_side and pos <= 0.25):
+            tags.append("strong_close")
+    return tags
+
+
+def build_alt_index(coin_dfs: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """직접 만든 알트 지수: 코인들의 봉별 수익률을 같은 비중으로 평균낸 뒤 누적 (BTC·ETH·스테이블코인은
+    넣지 않음). TOTAL3는 스테이블코인이 섞여 움직임이 무뎌지고 과거 데이터를 무료로 받을 수 없어서 대신 사용."""
+    rets = [d.set_index("ts")["close"].pct_change() for d in coin_dfs if d is not None and len(d) > 10]
+    if len(rets) < 3:
+        return None
+    m = pd.concat(rets, axis=1).sort_index().mean(axis=1, skipna=True).fillna(0.0).clip(-0.5, 0.5)
+    idx = (1 + m).cumprod() * 100
+    return pd.DataFrame({"ts": idx.index, "close": idx.to_numpy()}).reset_index(drop=True)
+
+
+def align_to(df: pd.DataFrame, bench: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """벤치마크(알트 지수 등)를 코인 캔들 시각에 맞춤 — 상대강도를 같은 봉끼리 비교하기 위해."""
+    if bench is None:
+        return None
+    out = df[["ts"]].merge(bench, on="ts", how="left")
+    out["close"] = out["close"].ffill()
+    return out if out["close"].notna().sum() > 10 else None
+
+
+def build_donchian_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.DataFrame,
+                         current_price: Optional[float] = None, alt_df: Optional[pd.DataFrame] = None,
+                         htf_trend: RegimeType = "sideways") -> Optional[CoinSetup]:
+    """신고점 돌파(돈치안): 마지막 완성봉 종가가 직전 N봉(약 20일) 최고가를 넘으면 롱, 최저가를 깨면 숏.
+    시장가 진입 기준이며 손절은 진입가에서 2 ATR, 목표1은 3 ATR, 이후 추적손절(전략 연구실에서 검증된 경우에만 추천)."""
+    n = DONCHIAN_N.get(TIMEFRAME, 120)
+    if df is None or len(df) < n + 20:
+        _rej("data_short")
+        return None
+    a = atr(df)
+    if not a or np.isnan(a) or a <= 0:
+        _rej("data_short")
+        return None
+    last = float(df["close"].iloc[-1])
+    prior_hi = float(df["high"].iloc[-n - 1:-1].max())
+    prior_lo = float(df["low"].iloc[-n - 1:-1].min())
+    price = float(current_price) if current_price is not None else last
+    if last > prior_hi:
+        direction, bias, sl, tp1, tp2 = "long", "donchian_long", last - 2 * a, last + 3 * a, last + 6 * a
+    elif last < prior_lo:
+        direction, bias, sl, tp1, tp2 = "short", "donchian_short", last + 2 * a, last - 3 * a, last - 6 * a
+    else:
+        _rej("no_donchian")
+        return None
+    problem = _signal_time_problem(direction, price, sl, tp1)
+    if problem:
+        _rej(problem)
+        return None
+    is_chase = price > last + CHASE_ATR * a if direction == "long" else price < last - CHASE_ATR * a
+    rs = relative_strength_vs_btc(df, btc_df)
+    rs_alt = relative_strength_vs_btc(df, alt_df) if alt_df is not None else None
+    days = n * pd.Timedelta(TIMEFRAME) / pd.Timedelta("1D")
+    note = (f"직전 {n}봉(약 {days:.0f}일) {'최고가 돌파' if direction == 'long' else '최저가 이탈'} → "
+            f"{'⏳ 이미 많이 움직임(추격 주의)' if is_chase else '✅ 시장가 진입 가능'}")
+    return CoinSetup(symbol, exchange_id, bias, note, last, price, tp1, tp2, sl, 1.5, is_chase,
+                     False, rs, None, atr=a, live_status="chase" if is_chase else "ready", rs_alt=rs_alt,
+                     tags=breakout_tags(df, direction, htf_trend, rs_alt, rs))
+
+
 def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.DataFrame,
                 regime: RegimeType, htf_trend: RegimeType = "sideways",
-                current_price: Optional[float] = None) -> Optional[CoinSetup]:
+                current_price: Optional[float] = None,
+                alt_df: Optional[pd.DataFrame] = None) -> Optional[CoinSetup]:
     """완성된 봉(df)으로 신호를 계산하고, 현재가(current_price)로 추격·무효 여부를 판단.
     - 상승/하락: 최근 임펄스 → 눌림목(오더블록 또는 EMA20)에 지정가, 목표는 직전 고점/저점(구조적 목표)
     - 횡보: 유효한 박스에서만 (A) 돌파 후 리테스트 또는 (B) 조용한 경계 역매매
@@ -1155,6 +1273,7 @@ def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.Data
     vol_avg20 = df["volume"].iloc[-21:-1].mean()
     rel_vol = float(df["volume"].iloc[-1] / vol_avg20) if vol_avg20 else 1.0  # 마지막 완성봉 거래량 배수
     rs = relative_strength_vs_btc(df, btc_df)
+    rs_alt = relative_strength_vs_btc(df, alt_df) if alt_df is not None else None
 
     def _extras():
         """조건을 통과한 경우에만 계산하는 무거운 지표들."""
@@ -1220,7 +1339,7 @@ def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.Data
                 f"{'⏳ 지정가 대기(지금은 추격)' if is_chase else '✅ 진입가 근처'}")
         return CoinSetup(symbol, exchange_id, bias, note, entry, price, tp1, tp2, sl, rr, is_chase,
                          poc_conf, rs, asym, sweep_confluence=sweep_conf, atr=a,
-                         live_status="chase" if is_chase else "ready")
+                         live_status="chase" if is_chase else "ready", rs_alt=rs_alt)
 
     # ---------------- 횡보: 유효한 박스에서만
     box = detect_box(df, a)
@@ -1249,9 +1368,10 @@ def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.Data
         tags = (" + 매물대 겹침" if poc_conf else "") + (" + 유동성 스윕" if sweep_conf else "")
         note = (f"{note_core}{tags}{lean_tag} → "
                 f"{'⏳ 지정가 대기(지금은 추격)' if is_chase else '✅ 진입가 근처'}")
+        tg = breakout_tags(df, direction, htf_trend, rs_alt, rs) if bias.startswith("wait_breakout") else []
         return CoinSetup(symbol, exchange_id, bias, note, entry, price, tp1, tp2, sl, rr, is_chase,
                          poc_conf, rs, asym, sweep_confluence=sweep_conf, atr=a,
-                         live_status="chase" if is_chase else "ready")
+                         live_status="chase" if is_chase else "ready", rs_alt=rs_alt, tags=tg)
 
     # (A) 돌파: 마지막 완성봉이 박스 밖에서 마감 + 거래량 1.5배 이상 → 돌파선 리테스트에 지정가
     #     손절은 박스 반대편 끝이 아니라 돌파선 너머 1 ATR (예전 방식은 손익비가 구조상 0.5~0.8이라 절대 추천 불가였음)
@@ -1358,17 +1478,24 @@ def build_universe(top_n: Optional[int] = None, perps: Optional[set] = None) -> 
     UNIVERSE_DIAG.clear()
     UNIVERSE_DIAG["합산 후보"] = len(ranked)
     if perps:
-        kept, dropped, mult_n = [], 0, 0
+        kept, dropped, mult_n, miss = [], 0, 0, []
         for sym, info in ranked:
             p, m = perp_match(sym, perps)
             if p is None:
                 dropped += 1
+                miss.append((sym, info["src"]))
                 continue
             info.update(perp=p, mult=m)
             mult_n += m > 1
             kept.append((sym, info))
         ranked = kept
-        UNIVERSE_DIAG.update({"Bitget 선물 없음": dropped, "배수 표기로 매칭(1000PEPE 등)": mult_n})
+        by_src: Dict[str, int] = {}
+        for _, src in miss:
+            by_src[src] = by_src.get(src, 0) + 1
+        UNIVERSE_DIAG.update({"Bitget 선물 없음": dropped, "배수 표기로 매칭(1000PEPE 등)": mult_n,
+                              "선물 없음 출처": "·".join(f"{k} {v}" for k, v in by_src.items()) or "-",
+                              "선물 없음 예시(거래량 큰 순)": " ".join(x.split("/")[0] for x, _ in miss[:15]) or "-",
+                              "선물 목록 예시": " ".join(sorted(x.split("/")[0] for x in perps)[:8])})
     else:
         for sym, info in ranked:
             info.update(perp=f"{sym}:{QUOTE}", mult=1)
@@ -1378,6 +1505,68 @@ def build_universe(top_n: Optional[int] = None, perps: Optional[set] = None) -> 
 
 
 LAST_SCAN_STATS: Dict = {}
+LAST_LOADED: Dict[str, tuple] = {}  # 마지막 스캔에서 받은 완성봉 {심볼: (거래소, df)} — 실전 추적에 재사용
+
+
+def watch_candidate(df: pd.DataFrame, htf_trend: RegimeType, live: float) -> Optional[Dict]:
+    """'돌파 임박' 관찰 후보: 유효한 박스 안에서 종가가 상단(또는 하단)에서 1 ATR 이내.
+    아직 진입 신호는 아니고, 거래량과 함께 박스를 벗어나 봉이 마감되면 추천으로 올라옴."""
+    a = atr(df)
+    if not a or np.isnan(a) or a <= 0:
+        return None
+    box = detect_box(df, a)
+    if not box["valid"]:
+        return None
+    last = float(df["close"].iloc[-1])
+    hi, lo = box["high"], box["low"]
+    if hi - 1.0 * a <= last <= hi:
+        side, trigger = "long", hi
+    elif lo <= last <= lo + 1.0 * a:
+        side, trigger = "short", lo
+    else:
+        return None
+    lean = compute_sideways_lean(df, htf_trend)
+    if (side == "long" and lean["score"] < -0.3) or (side == "short" and lean["score"] > 0.3):
+        return None
+    prev = df["volume"].iloc[-23:-3].mean()
+    return {"side": side, "trigger": float(trigger), "box_high": hi, "box_low": lo, "atr": float(a),
+            "last_close": last, "price": float(live), "dist_atr": abs(trigger - last) / a,
+            "vol_ratio": float(df["volume"].iloc[-3:].mean() / prev) if prev else None,
+            "lean": lean["label"], "touches": f"위 {box['touch_high']}회·아래 {box['touch_low']}회"}
+
+
+def _fetch_last_prices(by_ex: Dict[str, List[str]]) -> Dict[tuple, float]:
+    """거래소별로 한 번에 현재가 조회 {(거래소, 심볼): 가격}."""
+    prices: Dict[tuple, float] = {}
+    for ex_id, syms in by_ex.items():
+        try:
+            ex = _get_ex(ex_id)
+            try:
+                tickers = ex.fetch_tickers(syms)
+            except Exception:
+                tickers = ex.fetch_tickers()
+            for sym in syms:
+                t = tickers.get(sym) or {}
+                last = t.get("last") or t.get("close")
+                if last:
+                    prices[(ex_id, sym)] = float(last)
+        except Exception as e:
+            print(f"[warn] {ex_id} 현재가 조회 실패: {e}")
+    return prices
+
+
+def refresh_watch_prices(items: List[Dict]) -> None:
+    """관찰 목록 현재가 갱신. 현재가가 경계를 넘으면 '돌파 진행 중'(봉 마감 때 신호 확정) 표시."""
+    by_ex: Dict[str, List[str]] = {}
+    for w in items:
+        by_ex.setdefault(w["exchange"], []).append(w["symbol"])
+    prices = _fetch_last_prices(by_ex)
+    for w in items:
+        p = prices.get((w["exchange"], w["symbol"]))
+        if p is None:
+            continue
+        w["price"] = p
+        w["crossing"] = p > w["trigger"] if w["side"] == "long" else p < w["trigger"]
 
 
 def live_status_of(setup: "CoinSetup", price: float) -> str:
@@ -1454,10 +1643,24 @@ def needs_full_rescan(last_scan_utc: Optional[pd.Timestamp], timeframe: Optional
     return last_scan_utc < start and (utc_now() - start).total_seconds() >= grace_sec
 
 
+def apply_breakout_entry(x: CoinSetup) -> None:
+    """연구실에서 '돌파 즉시 진입'이 통과·적용됐으면, 아직 리테스트 대기 중인 박스 돌파 신호를 현재가 진입으로 바꿈."""
+    if BREAKOUT_ENTRY != "immediate" or not x.bias.startswith("wait_breakout") or not x.is_chase:
+        return
+    long_side = x.bias in LONG_BIASES
+    x.entry_price = x.current_price
+    risk = (x.entry_price - x.sl) if long_side else (x.sl - x.entry_price)
+    if risk <= 0:
+        return
+    x.rr_ratio = ((x.tp1 - x.entry_price) if long_side else (x.entry_price - x.tp1)) / risk
+    x.is_chase, x.live_status = False, "ready"
+    x.entry_note += " · 즉시 진입(연구실 적용 설정)"
+
+
 def screen_market(market_regime: RegimeType, progress_cb=None,
                   btc_df: Optional[pd.DataFrame] = None) -> List[CoinSetup]:
-    """코인마다 자기 차트의 '완성된 4시간봉'으로 개별 국면과 신호를 계산하고,
-    현재가(진행 중 봉의 최근 체결가)로 추격·무효 여부를 판단합니다.
+    """코인마다 자기 차트의 '완성된 봉'으로 개별 국면과 신호를 계산하고, 현재가로 추격·무효 여부를 판단.
+    1차로 모든 코인의 캔들을 받아 알트 지수를 만든 뒤(알트 지수 대비 상대강도용), 2차로 코인별 신호를 계산.
     스캔이 끝나면 LAST_SCAN_STATS에 필터별 제외 개수와 시장 참여도(상승/하락 추세 코인 수)를 남깁니다."""
     _REJECTS.clear()
     if btc_df is None:
@@ -1467,31 +1670,62 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
         print("[warn] Bitget 선물 목록을 못 가져와 '선물 거래 가능 여부' 필터를 건너뜁니다.")
     universe = build_universe(TOP_N_BY_VOLUME, perps or None)
     fund_ex = "bitget" if perps else None
-    setups: List[CoinSetup] = []
     breadth = {"uptrend": 0, "downtrend": 0, "sideways": 0, "n": 0}
     items = list(universe.items())
+    n_items = len(items)
 
+    loaded = []  # 1차: 캔들 받기
+    watch: List[Dict] = []
     for idx, (symbol, info) in enumerate(items):
-        exchange_id = info["src"]
         if progress_cb:
-            progress_cb(idx, len(items), symbol)
+            progress_cb(idx, 2 * n_items, f"데이터 {symbol}")
         try:
-            full = fetch_ohlcv(exchange_id, symbol)
+            full = fetch_ohlcv(info["src"], symbol)
             if full is None or len(full) < 61:
                 _rej("data_short")
                 continue
             df, live = split_live(full)
+            loaded.append((symbol, info, df, live))
+        except Exception as e:
+            _rej("error")
+            print(f"[warn] {symbol} 캔들 조회 실패: {e}")
+    alt = build_alt_index([d for sym, _, d, _ in loaded if sym.split("/")[0] not in ("BTC", "ETH")]) \
+        if len(loaded) >= 5 else None
+
+    setups: List[CoinSetup] = []
+    for idx, (symbol, info, df, live) in enumerate(loaded):  # 2차: 신호 계산
+        exchange_id = info["src"]
+        if progress_cb:
+            progress_cb(n_items + idx, 2 * n_items, symbol)
+        try:
             coin_regime = classify_price_trend(df)
             breadth[coin_regime] += 1
             breadth["n"] += 1
+            alt_al = align_to(df, alt)
             # 일봉은 횡보 기울기 계산에 먼저 필요, 추세 신호는 신호가 난 뒤에만 조회(API 절약)
             htf_trend = get_htf_trend(exchange_id, symbol) if coin_regime == "sideways" else None
             setup = build_setup(symbol, exchange_id, df, btc_df, coin_regime, htf_trend or "sideways",
-                                current_price=live)
-            if not setup:
-                continue
-            if SETUP_FAMILY.get(setup.bias) not in ENABLED_FAMILIES:
+                                current_price=live, alt_df=alt_al)
+            if setup and SETUP_FAMILY.get(setup.bias) not in ENABLED_FAMILIES:
                 _rej("family_off")
+                setup = None
+            if setup is None and "신고점 돌파" in ENABLED_FAMILIES:
+                setup = build_donchian_setup(symbol, exchange_id, df, btc_df, live, alt_al, htf_trend or "sideways")
+                if setup is not None and htf_trend is None:  # 표시(일봉 방향 일치) 계산을 위해 신호가 났을 때만 조회
+                    htf_trend = get_htf_trend(exchange_id, symbol)
+                    setup.tags = breakout_tags(df, "long" if setup.bias in LONG_BIASES else "short",
+                                               htf_trend, setup.rs_alt, setup.rs)
+            if not setup:
+                if coin_regime == "sideways" and "돌파" in ENABLED_FAMILIES:
+                    wc = watch_candidate(df, htf_trend or "sideways", live)
+                    if wc:
+                        wc.update(symbol=symbol, exchange=exchange_id, perp_symbol=info.get("perp", ""),
+                                  perp_mult=int(info.get("mult", 1)))
+                        watch.append(wc)
+                continue
+            fam = SETUP_FAMILY.get(setup.bias)
+            if FILTER_TAGS and fam in ("돌파", "신고점 돌파") and not FILTER_TAGS <= set(setup.tags):
+                _rej("tag_filter")
                 continue
             setup.coin_regime = coin_regime
             setup.counter_trend = coin_regime in ("uptrend", "downtrend") and coin_regime != market_regime
@@ -1516,6 +1750,7 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
                 print(f"[skip] {symbol}: 펀딩비 과열 방향이라 제외 ({setup.bias})")
                 continue
 
+            setup.signal_ts = str(df["ts"].iloc[-1])
             setup.bitget_perp = True if perps else None
             setup.perp_symbol, setup.perp_mult = info.get("perp", ""), int(info.get("mult", 1))
             setups.append(setup)
@@ -1524,12 +1759,16 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
             print(f"[warn] {symbol} 분석 실패: {e}")
 
     if progress_cb:
-        progress_cb(len(items), len(items), "")
+        progress_cb(2 * n_items, 2 * n_items, "")
 
     # 손익비 최소 기준 — 매물대 겹침 또는 유동성 스윕이 있으면 1.3, 없으면 1.5
+    # (신고점 돌파는 손절 2 ATR·목표 3 ATR로 고정된 추세 추종 규칙이라 제외 — 연구실 검증 기준 그대로)
     passed = []
     for x in setups:
-        if x.rr_ratio >= (1.3 if (x.poc_confluence or x.sweep_confluence) else 1.5):
+        if SETUP_FAMILY.get(x.bias) == "신고점 돌파" or \
+                x.rr_ratio >= (1.3 if (x.poc_confluence or x.sweep_confluence) else 1.5):
+            apply_breakout_entry(x)
+            x.market_entry = x.bias.startswith("donchian") or "즉시 진입" in x.entry_note
             passed.append(x)
         else:
             _rej("low_rr")
@@ -1537,10 +1776,190 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
 
     LAST_SCAN_STATS.clear()
     LAST_SCAN_STATS.update({"universe_diag": dict(UNIVERSE_DIAG), "rejects": dict(_REJECTS), "breadth": dict(breadth),
-                            "universe": len(items), "passed": len(passed)})
+                            "universe": n_items, "passed": len(passed), "alt_index": alt is not None,
+                            "watchlist": sorted(watch, key=lambda w: w["dist_atr"])})
+    LAST_LOADED.clear()
+    LAST_LOADED.update({sym: (info["src"], d) for sym, info, d, _ in loaded})
     summary = ", ".join(f"{REJECT_LABELS.get(k, k)} {v}" for k, v in sorted(_REJECTS.items(), key=lambda kv: -kv[1]))
-    print(f"[필터 통과율] 대상 {len(items)}개 → 최종 {len(passed)}개 | 제외: {summary or '없음'}")
+    print(f"[필터 통과율] 대상 {n_items}개 → 최종 {len(passed)}개 | 제외: {summary or '없음'}")
     return passed
+
+
+ACTIVE_TRACK = ("대기", "보유")
+
+
+def load_tracks() -> List[Dict]:
+    try:
+        with open(TRACK_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_tracks(tracks: List[Dict]) -> None:
+    try:
+        with open(TRACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(tracks[-600:], f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[warn] 추적 기록 저장 실패: {e}")
+
+
+def track_new_setups(setups: List[CoinSetup], tracks: List[Dict]) -> int:
+    """새 추천을 추적 기록에 추가 (같은 신호는 한 번만, 같은 코인·방향이 진행 중이면 추가 안 함)."""
+    keys = {t["key"] for t in tracks}
+    active = {(t["symbol"], t["direction"]) for t in tracks if t["status"] in ACTIVE_TRACK}
+    added = 0
+    for x in setups:
+        if not x.signal_ts:
+            continue
+        direction = "long" if x.bias in LONG_BIASES else "short"
+        key = f"{x.symbol}|{x.bias}|{x.signal_ts}"
+        if key in keys or (x.symbol, direction) in active:
+            continue
+        tracks.append({"key": key, "symbol": x.symbol, "exchange": x.exchange, "bias": x.bias,
+                       "family": SETUP_FAMILY.get(x.bias, x.bias), "direction": direction,
+                       "signal_ts": x.signal_ts, "entry": x.entry_price, "sl": x.sl, "tp1": x.tp1,
+                       "atr": x.atr, "is_chase": bool(x.is_chase), "market": bool(x.market_entry),
+                       "tags": list(x.tags), "created": str(utc_now()), "status": "대기", "R": None})
+        active.add((x.symbol, direction))
+        added += 1
+    return added
+
+
+def update_tracks(tracks: List[Dict], loaded: Dict[str, tuple]) -> None:
+    """진행 중인 추적 기록의 결과를 실제 완성봉으로 다시 계산 (과거 검증과 같은 체결·청산 규칙).
+    '추천대로 모두 진입했다면'을 가정한 결과라 실제 체결과는 조금 다를 수 있음."""
+    for t in tracks:
+        if t["status"] not in ACTIVE_TRACK:
+            continue
+        try:
+            got = loaded.get(t["symbol"])
+            df = got[1] if got else drop_unclosed(fetch_ohlcv(t["exchange"], t["symbol"]))
+            if df is None or df.empty:
+                continue
+            df = df.reset_index(drop=True)
+            hit = df.index[df["ts"] == pd.Timestamp(t["signal_ts"])]
+            if len(hit) == 0:
+                continue
+            idx = int(hit[0])
+            sig = {idx: {"direction": t["direction"], "bias": t["bias"], "entry": t["entry"], "sl": t["sl"],
+                         "tp1": t["tp1"], "atr": t["atr"], "is_chase": t["is_chase"], "market": t["market"],
+                         "tags": t.get("tags", [])}}
+            tr = simulate_exits(df.iloc[:], sig, "partial_trail", entry_mode="retest")
+            if tr:
+                x = tr[0]
+                t.update(status="종료", R=round(x["R"], 3), gross_R=round(x["gross_R"], 3), reason=x["reason"],
+                         exit_ts=str(df["ts"].iloc[x["exit_idx"]]))
+                continue
+            after = df.iloc[idx + 1:idx + 16]
+            long_side = t["direction"] == "long"
+            if t["market"] or not t["is_chase"]:
+                t["status"] = "보유"
+            elif len(after) and ((after["low"] <= t["entry"]).any() if long_side else (after["high"] >= t["entry"]).any()):
+                t["status"] = "보유"
+            elif len(after) and ((after["close"] < t["sl"]).any() if long_side else (after["close"] > t["sl"]).any()):
+                t["status"] = "미체결"
+            elif len(df) - 1 - idx >= 15:
+                t["status"] = "미체결"
+        except Exception as e:
+            print(f"[warn] 추적 갱신 실패 {t.get('symbol')}: {e}")
+
+
+def tracking_summary(tracks: List[Dict], ref: Optional[Dict] = None) -> tuple:
+    """신호 유형별 실전 추적 요약 + 과거 검증 기준선과 비교."""
+    rows, notes = [], []
+    health = family_health(tracks, ref)
+    for fam in sorted({t["family"] for t in tracks}):
+        v = [t for t in tracks if t["family"] == fam]
+        closed = [t["R"] for t in v if t["status"] == "종료" and t.get("R") is not None][-30:]
+        row = {"신호 유형": fam, "종료": len(closed), "보유": sum(t["status"] == "보유" for t in v),
+               "대기": sum(t["status"] == "대기" for t in v), "미체결": sum(t["status"] == "미체결" for t in v),
+               "승률": f"{np.mean([r > 0 for r in closed]):.0%}" if closed else "-",
+               "평균 R": round(float(np.mean(closed)), 2) if closed else None,
+               "합계 R": round(float(np.sum(closed)), 1) if closed else None}
+        h = health.get(fam, {})
+        row["자동 방어"] = HEALTH_LABEL.get(h.get("state", "unknown"), "-")
+        rows.append(row)
+        if h:
+            exp = f", 과거 검증 예상 {h['expected']:+.2f}R" if h.get("expected") is not None else ""
+            notes.append(f"{HEALTH_LABEL.get(h['state'], '')} {fam}: {h['reason']} ({h['basis']}{exp})")
+    return rows, notes
+
+
+def lab_reference_from(lab: Dict) -> Dict:
+    """연구실 결과에서 자동 방어 기준선(진입 방식별 거래당 R의 평균·표준편차)을 뽑음."""
+    ref = {"made_at": str(utc_now()), "version": APP_VERSION, "timeframe": lab.get("timeframe"),
+           "per_coin_month": lab.get("per_coin_month", {})}
+    for key in ("base", "immediate", "donchian"):
+        r = [x["R"] for x in lab["trades"].get(key, [])]
+        if len(r) >= 20:
+            ref[key] = {"mu": float(np.mean(r)), "sd": float(np.std(r)), "n": len(r), "R": [round(x, 4) for x in r[-1000:]]}
+    return ref
+
+
+def save_lab_reference(ref: Dict) -> None:
+    try:
+        with open(LAB_REF_FILE, "w", encoding="utf-8") as f:
+            json.dump(ref, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[warn] 기준선 저장 실패: {e}")
+
+
+def load_lab_reference() -> Optional[Dict]:
+    try:
+        with open(LAB_REF_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _family_ref(ref: Optional[Dict], fam: str):
+    if not ref:
+        return None
+    key = {"돌파": "immediate" if BREAKOUT_ENTRY == "immediate" else "base", "신고점 돌파": "donchian"}.get(fam)
+    v = ref.get(key) if key else None
+    return (v["mu"], v["sd"]) if v else None
+
+
+HEALTH_LABEL = {"normal": "✅ 정상", "caution": "⚠️ 주의 · 리스크 절반", "paused": "⏸ 자동 중지", "unknown": "ⓘ 판단 전"}
+
+
+def family_health(tracks: List[Dict], ref: Optional[Dict] = None) -> Dict[str, Dict]:
+    """신호 유형별 자동 방어 상태 (최근 종료된 실전 추적 결과 기준).
+    - 주의: 최근 15건 평균이 기준선 정상 범위(평균 − 2×표준오차) 아래 → 권장 리스크 절반
+    - 자동 중지: 최근 30건 평균까지 정상 범위 아래 → 진입 대상에서 제외(참고용 표시, 추적은 계속)
+    - 기준선(연구실 결과)이 없으면 최근 평균 −0.3R 미만을 기준으로 씀
+    - 성과가 범위 안으로 돌아오면 자동 복귀. 좋아졌다고 리스크를 올리는 일은 없음"""
+    out: Dict[str, Dict] = {}
+    for fam in sorted({t["family"] for t in tracks}):
+        closed = [t["R"] for t in tracks if t["family"] == fam and t["status"] == "종료" and t.get("R") is not None]
+        mr = _family_ref(ref, fam)
+
+        def low_line(k: int) -> float:
+            return mr[0] - 2 * mr[1] / np.sqrt(k) if mr else FALLBACK_LOW_R
+
+        info = {"n": len(closed), "expected": mr[0] if mr else None, "basis": "연구실 기준선" if mr else "고정 기준(−0.3R)"}
+        if len(closed) >= 30 and np.mean(closed[-30:]) < low_line(30):
+            state, avg, line = "paused", float(np.mean(closed[-30:])), low_line(30)
+        elif len(closed) >= 15 and np.mean(closed[-15:]) < low_line(15):
+            state, avg, line = "caution", float(np.mean(closed[-15:])), low_line(15)
+        elif len(closed) >= 15:
+            state, avg, line = "normal", float(np.mean(closed[-15:])), low_line(15)
+        else:
+            state, avg, line = "unknown", float(np.mean(closed)) if closed else None, None
+        if not AUTO_DEFENSE and state in ("paused", "caution"):
+            state = "normal"
+        info.update(state=state, avg=avg, line=line)
+        if state == "paused":
+            info["reason"] = f"최근 30건 평균 {avg:+.2f}R < 기준 {line:+.2f}R — 진입 대상에서 자동 제외(추적은 계속)"
+        elif state == "caution":
+            info["reason"] = f"최근 15건 평균 {avg:+.2f}R < 기준 {line:+.2f}R — 권장 리스크 자동 절반"
+        elif state == "normal":
+            info["reason"] = f"최근 15건 평균 {avg:+.2f}R (기준 {line:+.2f}R 이상)"
+        else:
+            info["reason"] = f"종료된 추천 {len(closed)}건 — 15건부터 판단"
+        out[fam] = info
+    return out
 
 
 def run_analysis(risk_cfg: Optional[RiskConfig] = None, progress_cb=None) -> Dict:
@@ -1559,8 +1978,27 @@ def run_analysis(risk_cfg: Optional[RiskConfig] = None, progress_cb=None) -> Dic
     regime = compose_market_regime(inputs, stats.get("breadth"), commit=True)
     for x in all_setups:  # 최종 국면 기준으로 역행 표시 다시 계산
         x.counter_trend = x.coin_regime in ("uptrend", "downtrend") and x.coin_regime != regime.overall
-    setups = cap_correlated_exposure(all_setups, risk_cfg) if all_setups else []
-    return {"regime": regime, "breaker": breaker, "setups": setups, "all_setups": all_setups,
+    health: Dict[str, Dict] = {}
+    tracks: List[Dict] = []
+    try:  # 실전 추적: 진행 중인 기록 결과 갱신 → 자동 방어 상태 계산
+        tracks = load_tracks()
+        update_tracks(tracks, LAST_LOADED)
+        health = family_health(tracks, load_lab_reference())
+    except Exception as e:
+        print(f"[warn] 실전 추적 갱신 실패: {e}")
+    for x in all_setups:
+        st_ = health.get(SETUP_FAMILY.get(x.bias, ""), {}).get("state", "")
+        x.health = st_ if st_ in ("caution", "paused") else ""
+        x.risk_mult = 0.5 if x.health == "caution" else 1.0
+    active = [x for x in all_setups if x.health != "paused"]
+    paused = [x for x in all_setups if x.health == "paused"]
+    setups = cap_correlated_exposure(active, risk_cfg) if active else []
+    try:  # 새 추천 추적 (자동 중지된 신호도 계속 추적해야 성과 회복을 알 수 있음)
+        track_new_setups(setups + paused, tracks)
+        _save_tracks(tracks)
+    except Exception as e:
+        print(f"[warn] 실전 추적 저장 실패: {e}")
+    return {"regime": regime, "breaker": breaker, "setups": setups, "all_setups": all_setups, "health": health,
             "risk_cfg": risk_cfg, "asof": pd.Timestamp.now(), "asof_utc": utc_now(),
             "timeframe": TIMEFRAME, "filter_stats": stats}
 
@@ -1603,7 +2041,8 @@ def _htf_bars_needed(total_bars: int) -> int:
 
 def compute_trade_R(direction: str, entry: float, sl: float, exit_price: float,
                      holding_bars: int, fee_pct: float = 0.05, slippage_pct: float = 0.03,
-                     funding_pct_per_8h: float = 0.01, bars_per_8h: Optional[float] = None) -> float:
+                     funding_pct_per_8h: float = 0.01, bars_per_8h: Optional[float] = None,
+                     entry_cost_pct: Optional[float] = None, exit_cost_pct: Optional[float] = None) -> float:
     """손익을 'R 배수'(최초 리스크 대비 몇 배)로 환산. 계좌 크기와 무관하게 전략 자체의
     품질을 비교할 수 있어서 WFO/기대값 계산에 표준적으로 쓰입니다. 수수료·슬리피지·펀딩비를
     전부 비용으로 차감한 '순(net) R'입니다."""
@@ -1612,44 +2051,63 @@ def compute_trade_R(direction: str, entry: float, sl: float, exit_price: float,
     if risk_per_unit <= 0:
         return 0.0
     raw = (exit_price - entry) if direction == "long" else (entry - exit_price)
-    cost_price = entry * 2 * (fee_pct + slippage_pct) / 100          # 왕복 수수료+슬리피지
+    if entry_cost_pct is not None and exit_cost_pct is not None:     # 진입·청산 방식별 실제 비용
+        cost_price = entry * (entry_cost_pct + exit_cost_pct) / 100
+    else:                                                            # (예전 방식) 왕복 수수료+슬리피지
+        cost_price = entry * 2 * (fee_pct + slippage_pct) / 100
     funding_price = entry * (funding_pct_per_8h / 100) * (holding_bars / bars_per_8h)
     net = raw - cost_price - funding_price
     return net / risk_per_unit
 
 
 SETUP_FAMILY = {"long": "추세", "short": "추세", "wait_breakout_long": "돌파", "wait_breakout_short": "돌파",
-                "range_fade_long": "박스 역매매", "range_fade_short": "박스 역매매"}
+                "range_fade_long": "박스 역매매", "range_fade_short": "박스 역매매",
+                "donchian_long": "신고점 돌파", "donchian_short": "신고점 돌파"}
+
+
+def _htf_lookup(df: pd.DataFrame, htf_df: Optional[pd.DataFrame]):
+    """봉 i가 끝난 시점까지 '마감된' 상위 봉 기준 추세를 돌려주는 함수 (미래 참조 방지)."""
+    if htf_df is None or len(htf_df) < 60:
+        return lambda i: "sideways"
+    htf_df = htf_df.reset_index(drop=True)
+    reg = trend_series(htf_df)
+    close_t = (htf_df["ts"] + pd.Timedelta(HTF_TIMEFRAME)).to_numpy()
+    ts = df["ts"].to_numpy()
+    tf = pd.Timedelta(TIMEFRAME)
+
+    def f(i: int) -> RegimeType:
+        k = int(np.searchsorted(close_t, ts[i] + tf, side="right")) - 1
+        return reg[k] if k >= 59 else "sideways"
+    return f
 
 
 def generate_signals(df: pd.DataFrame, btc_df: pd.DataFrame, htf_df: Optional[pd.DataFrame],
-                     warmup: int = 250) -> Dict[int, Dict]:
+                     warmup: int = 250, alt_df: Optional[pd.DataFrame] = None,
+                     families: Optional[set] = None) -> Dict[int, Dict]:
     """과거 모든 봉에서 라이브와 같은 규칙으로 신호를 계산 (그 봉까지의 데이터만 사용).
     - 국면: 코인 자신의 추세 (전체 구간 한 번 계산, 라이브와 99.9% 일치)
     - 상위추세: 그 시점까지 '마감된' 상위 봉 기준
     - 라이브와 같은 필터: 상위추세 역행 제외, 손익비 1.5(보조 근거 있으면 1.3) 미만 제외
+    - families={"돌파"}면 횡보 국면 봉만 계산(돌파 신호는 횡보에서만 나옴 → 속도 향상)
     - 과거 기록이 없는 필터(스프레드·펀딩비·거래대금)는 적용하지 못함"""
     df = df.reset_index(drop=True)
     btc_df = btc_df.reset_index(drop=True)
+    alt_df = alt_df.reset_index(drop=True) if alt_df is not None else None
     reg = trend_series(df)
-    htf_reg, htf_close = None, None
-    if htf_df is not None and len(htf_df) >= 60:
-        htf_df = htf_df.reset_index(drop=True)
-        htf_reg = trend_series(htf_df)
-        htf_close = (htf_df["ts"] + pd.Timedelta(HTF_TIMEFRAME)).to_numpy()
-    tf = pd.Timedelta(TIMEFRAME)
-    ts = df["ts"].to_numpy()
+    htf_at = _htf_lookup(df, htf_df)
+    only_sideways = families is not None and families <= {"돌파", "박스 역매매"}
     window = max(260, max(RS_WINDOWS) + 20)
     signals: Dict[int, Dict] = {}
     for i in range(max(warmup, 60), len(df)):
-        htf_i = "sideways"
-        if htf_reg is not None:
-            k = int(np.searchsorted(htf_close, ts[i] + tf, side="right")) - 1
-            if k >= 59:
-                htf_i = htf_reg[k]
+        if only_sideways and reg[i] != "sideways":
+            continue
+        htf_i = htf_at(i)
         lo = max(0, i + 1 - window)
-        x = build_setup("bt", "backtest", df.iloc[lo:i + 1], btc_df.iloc[lo:i + 1], reg[i], htf_i)
+        x = build_setup("bt", "backtest", df.iloc[lo:i + 1], btc_df.iloc[lo:i + 1], reg[i], htf_i,
+                        alt_df=alt_df.iloc[lo:i + 1] if alt_df is not None else None)
         if x is None:
+            continue
+        if families is not None and SETUP_FAMILY.get(x.bias) not in families:
             continue
         if (x.bias == "long" and htf_i == "downtrend") or (x.bias == "short" and htf_i == "uptrend"):
             continue
@@ -1658,25 +2116,69 @@ def generate_signals(df: pd.DataFrame, btc_df: pd.DataFrame, htf_df: Optional[pd
         signals[i] = {"direction": "long" if x.bias in LONG_BIASES else "short", "bias": x.bias,
                       "entry": x.entry_price, "sl": x.sl, "tp1": x.tp1, "atr": x.atr,
                       "is_chase": x.is_chase, "rr": x.rr_ratio,
-                      "atr_pct": x.atr / x.entry_price * 100 if x.entry_price else None}
+                      "atr_pct": x.atr / x.entry_price * 100 if x.entry_price else None,
+                      "tags": list(x.tags), "rs": x.rs, "rs_alt": x.rs_alt}
+    return signals
+
+
+def generate_donchian_signals(df: pd.DataFrame, btc_df: pd.DataFrame, htf_df: Optional[pd.DataFrame],
+                              alt_df: Optional[pd.DataFrame] = None, warmup: int = 250) -> Dict[int, Dict]:
+    """과거 신고점 돌파 신호 (라이브 build_donchian_setup과 같은 규칙, 신호 봉 종가에 시장가 진입)."""
+    df = df.reset_index(drop=True)
+    n = DONCHIAN_N.get(TIMEFRAME, 120)
+    hi_prev = df["high"].shift(1).rolling(n).max().to_numpy()
+    lo_prev = df["low"].shift(1).rolling(n).min().to_numpy()
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
+    atr_s = tr.rolling(14).mean().to_numpy()
+    c = df["close"].to_numpy()
+    htf_at = _htf_lookup(df, htf_df)
+    window = max(260, max(RS_WINDOWS) + 20)
+    signals: Dict[int, Dict] = {}
+    for i in range(max(warmup, n + 20), len(df)):
+        a = atr_s[i]
+        if not a or np.isnan(a) or np.isnan(hi_prev[i]):
+            continue
+        if c[i] > hi_prev[i]:
+            direction, bias, sl, tp1 = "long", "donchian_long", c[i] - 2 * a, c[i] + 3 * a
+        elif c[i] < lo_prev[i]:
+            direction, bias, sl, tp1 = "short", "donchian_short", c[i] + 2 * a, c[i] - 3 * a
+        else:
+            continue
+        lo = max(0, i + 1 - window)
+        w = df.iloc[lo:i + 1]
+        rs = relative_strength_vs_btc(w, btc_df.iloc[lo:i + 1])
+        rs_alt = relative_strength_vs_btc(w, alt_df.iloc[lo:i + 1]) if alt_df is not None else None
+        signals[i] = {"direction": direction, "bias": bias, "entry": float(c[i]), "sl": float(sl),
+                      "tp1": float(tp1), "atr": float(a), "is_chase": False, "market": True, "rr": 1.5,
+                      "atr_pct": a / c[i] * 100, "tags": breakout_tags(w, direction, htf_at(i), rs_alt, rs),
+                      "rs": rs, "rs_alt": rs_alt}
     return signals
 
 
 def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = "partial_trail",
-                   pending_expiry_bars: int = 15, max_hold_bars: int = 60) -> List[Dict]:
-    """신호를 봉 단위로 재생하며 체결·청산을 시뮬레이션. 거래별 상세(순 R, 진입·청산 봉, 사유)를 반환.
-    - 추격 신호는 지정가 대기 → 이후 봉에서 닿아야 체결, 체결 전 종가가 손절선을 넘으면 취소
+                   pending_expiry_bars: int = 15, max_hold_bars: int = 60,
+                   entry_mode: str = "retest", slip_pct: Optional[float] = None) -> List[Dict]:
+    """신호를 봉 단위로 재생하며 체결·청산을 시뮬레이션. 거래별 상세(순 R, 비용 전 R, 표시 등)를 반환.
+    - entry_mode="retest": 추격 신호는 지정가 대기 → 이후 봉에서 닿아야 체결(체결 전 손절선 넘으면 취소)
+    - entry_mode="immediate": 추격 신호도 신호 봉 종가에 바로 시장가 진입
+    - 신호에 market=True가 있으면(신고점 돌파) 항상 신호 봉 종가에 시장가 진입
+    - 비용: 지정가 체결·목표1 익절 = 메이커 수수료 / 시장가 진입·손절·추적손절·기간만료 = 테이커 + 슬리피지
     - exit_mode="partial_trail": 목표1 절반 익절 → 남은 절반 본전 손절 → 최고/최저가에서 TRAIL_ATR×ATR 되돌리면 정리
     - exit_mode="fixed": 목표1에서 전량 청산 (비교용)
     - 같은 봉에서 손절·목표 동시 도달 시 손절 처리(보수적), 추적 손절선은 직전 봉까지 기준(미래 참조 방지)
     - 한 번에 하나의 포지션만"""
+    slip = DEFAULT_SLIPPAGE_PCT if slip_pct is None else slip_pct
+    maker, taker = MAKER_FEE_PCT, TAKER_FEE_PCT + slip
     lows, highs, closes = df["low"].to_numpy(), df["high"].to_numpy(), df["close"].to_numpy()
     trades: List[Dict] = []
     pending: Optional[Dict] = None
     t: Optional[Dict] = None
 
-    def _R(exit_price: float, hold: int, weight: float) -> float:
-        return weight * compute_trade_R(t["direction"], t["entry"], t["sl"], exit_price, hold)
+    def _R(exit_price: float, hold: int, weight: float, kind: str) -> float:
+        exit_cost = maker if kind == "tp" else taker
+        return weight * compute_trade_R(t["direction"], t["entry"], t["sl"], exit_price, hold,
+                                        entry_cost_pct=t["entry_cost"], exit_cost_pct=exit_cost)
 
     def _G(exit_price: float, weight: float) -> float:  # 비용(수수료·슬리피지·펀딩) 빼기 전
         return weight * compute_trade_R(t["direction"], t["entry"], t["sl"], exit_price, 0,
@@ -1684,8 +2186,17 @@ def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = 
 
     def _done(total_r: float, i: int, reason: str, gross: float) -> None:
         trades.append({"R": float(total_r), "gross_R": float(gross), "atr_pct": t.get("atr_pct"),
-                       "entry_idx": t["entry_idx"], "exit_idx": i,
-                       "direction": t["direction"], "bias": t["bias"], "reason": reason})
+                       "entry_idx": t["entry_idx"], "exit_idx": i, "direction": t["direction"],
+                       "bias": t["bias"], "reason": reason, "tags": list(t.get("tags", [])),
+                       "rs": t.get("rs"), "rs_alt": t.get("rs_alt"), "entry_type": t["entry_type"]})
+
+    def _open(sig: Dict, i: int, price: float, entry_type: str) -> Optional[Dict]:
+        long_side = sig["direction"] == "long"
+        if (long_side and (price <= sig["sl"] or price >= sig["tp1"])) or \
+           (not long_side and (price >= sig["sl"] or price <= sig["tp1"])):
+            return None  # 진입 시점에 이미 손절선 너머이거나 목표 도달 → 진입 안 함
+        return {**sig, "entry": float(price), "entry_idx": i, "stage": 0, "realized": 0.0, "realized_g": 0.0,
+                "entry_type": entry_type, "entry_cost": maker if entry_type == "지정가" else taker}
 
     for i in range(len(df)):
         if t:
@@ -1695,34 +2206,34 @@ def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = 
                 hit_sl = lows[i] <= t["sl"] if long_side else highs[i] >= t["sl"]
                 hit_tp = highs[i] >= t["tp1"] if long_side else lows[i] <= t["tp1"]
                 if hit_sl:
-                    _done(_R(t["sl"], hold, 1.0), i, "손절", _G(t["sl"], 1.0)); t = None
+                    _done(_R(t["sl"], hold, 1.0, "stop"), i, "손절", _G(t["sl"], 1.0)); t = None
                 elif hit_tp and exit_mode == "fixed":
-                    _done(_R(t["tp1"], hold, 1.0), i, "목표1", _G(t["tp1"], 1.0)); t = None
+                    _done(_R(t["tp1"], hold, 1.0, "tp"), i, "목표1", _G(t["tp1"], 1.0)); t = None
                 elif hit_tp:
-                    t["realized"] = _R(t["tp1"], hold, PARTIAL_TP_FRACTION)
+                    t["realized"] = _R(t["tp1"], hold, PARTIAL_TP_FRACTION, "tp")
                     t["realized_g"] = _G(t["tp1"], PARTIAL_TP_FRACTION)
                     t["stage"], t["stop"] = 1, t["entry"]
                     t["best"] = highs[i] if long_side else lows[i]
                 elif hold >= max_hold_bars:
-                    _done(_R(closes[i], hold, 1.0), i, "기간만료", _G(closes[i], 1.0)); t = None
+                    _done(_R(closes[i], hold, 1.0, "time"), i, "기간만료", _G(closes[i], 1.0)); t = None
             else:
                 rest = 1.0 - PARTIAL_TP_FRACTION
                 if long_side:
                     t["stop"] = max(t["stop"], t["best"] - TRAIL_ATR * t["atr"])
                     if lows[i] <= t["stop"]:
-                        _done(t["realized"] + _R(t["stop"], hold, rest), i, "추적손절",
+                        _done(t["realized"] + _R(t["stop"], hold, rest, "stop"), i, "추적손절",
                               t["realized_g"] + _G(t["stop"], rest)); t = None
                     else:
                         t["best"] = max(t["best"], highs[i])
                 else:
                     t["stop"] = min(t["stop"], t["best"] + TRAIL_ATR * t["atr"])
                     if highs[i] >= t["stop"]:
-                        _done(t["realized"] + _R(t["stop"], hold, rest), i, "추적손절",
+                        _done(t["realized"] + _R(t["stop"], hold, rest, "stop"), i, "추적손절",
                               t["realized_g"] + _G(t["stop"], rest)); t = None
                     else:
                         t["best"] = min(t["best"], lows[i])
                 if t and hold >= max_hold_bars:
-                    _done(t["realized"] + _R(closes[i], hold, rest), i, "기간만료",
+                    _done(t["realized"] + _R(closes[i], hold, rest, "time"), i, "기간만료",
                           t["realized_g"] + _G(closes[i], rest)); t = None
             continue
         if pending:
@@ -1730,17 +2241,21 @@ def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = 
             filled = lows[i] <= pending["entry"] if long_side else highs[i] >= pending["entry"]
             invalid = closes[i] < pending["sl"] if long_side else closes[i] > pending["sl"]
             if filled:
-                t = {**pending, "entry_idx": i, "stage": 0, "realized": 0.0}
+                t = {**pending, "entry_idx": i, "stage": 0, "realized": 0.0, "realized_g": 0.0,
+                     "entry_type": "지정가", "entry_cost": maker}
                 pending = None
             elif invalid or i >= pending["expiry_idx"]:
                 pending = None
             continue
         sig = signals.get(i)
-        if sig:
-            if sig["is_chase"]:
-                pending = {**sig, "expiry_idx": i + pending_expiry_bars}
-            else:
-                t = {**sig, "entry_idx": i, "stage": 0, "realized": 0.0}
+        if not sig:
+            continue
+        if sig.get("market") or (sig["is_chase"] and entry_mode == "immediate"):
+            t = _open(sig, i, closes[i], "시장가")
+        elif sig["is_chase"]:
+            pending = {**sig, "expiry_idx": i + pending_expiry_bars}
+        else:
+            t = _open(sig, i, sig["entry"], "지정가")
     return trades
 
 
@@ -2062,6 +2577,14 @@ def backtest_report_text(bt: Dict, risk_pct: float = 1.0) -> str:
                  for r in tb.to_dict("records")] if len(tb) else []
         lines.append(f"- {label}별(분할익절): " + (", ".join(parts) or "없음"))
     lines.append("- 돌파 점검: " + " / ".join(family_check_lines(family_check(tr, "돌파"))))
+    br = [x for x in tr if SETUP_FAMILY.get(x["bias"]) == "돌파"]
+    sb = summarize_trades(br)
+    if sb["n"]:
+        lines.append(f"- 돌파만: {sb['n']}건, 승률 {sb['win_rate']:.0%}, 평균 {sb['avg_R']:+.2f}R, PF {sb['pf']:.2f}, "
+                     f"최대연속손실 {sb['max_consec_loss']}, 최대낙폭 {sb['max_dd_R']:.1f}R")
+        vb = backtest_group_table(br, "vol")
+        lines.append("- 돌파 변동성별: " + ", ".join(f"{r['구분']} {r['거래 수']}건 {r['평균 R']:+.2f}R"
+                                                  for r in vb.to_dict("records")))
     lines.append("- " + suggest_scan_count(tr, {"돌파"}))
     if bt["errors"]:
         lines.append(f"- 제외된 코인 {len(bt['errors'])}개: " + " / ".join(bt["errors"][:8]))
@@ -2079,6 +2602,586 @@ def compare_exit_modes(df: pd.DataFrame, btc_df: pd.DataFrame, htf_df: pd.DataFr
                      "승률": float(np.mean([x > 0 for x in r])) if r else 0.0,
                      "최대 R": float(np.max(r)) if r else 0.0})
     return pd.DataFrame(rows)
+
+
+# ==========================================================================
+# 추세 포트폴리오 (시계열 모멘텀, 롱 위주, 매일 조정)
+# ==========================================================================
+TSM_ENABLED = False              # 연구실 통과 후 '이 설정 적용'으로 켜짐 (설정에서 직접 켤 수도 있음)
+TSM_EMA = 50                     # 추세 기준: 일봉 종가 > 50일 지수이동평균
+TSM_LOOKBACK = 30                # 그리고 30일 수익률 > 0
+TSM_VOL_WIN = 30                 # 변동성 계산 기간(일)
+TSM_TARGET_DAILY_VOL = 0.005     # 코인 하나가 하루에 계좌를 약 0.5% 움직이도록 비중 결정(변동성 반비례)
+TSM_MAX_WEIGHT = 0.30            # 코인 하나 최대 비중(계좌의 30%)
+TSM_MAX_GROSS = 1.0              # 전체 비중 합계 상한(계좌의 100%, 추가 레버리지 없음)
+TSM_REBAL_BAND = 0.25            # 비중 변화가 25% 미만이면 조정 안 함(수수료 절약)
+TSM_FUNDING_DAILY = 0.0003       # 롱 펀딩비 근사(8시간 0.01% × 3 = 하루 0.03%)
+
+
+def tsm_weights(close: pd.DataFrame) -> pd.DataFrame:
+    """close: 날짜×코인 일봉 종가 → 날짜별 목표 비중(계좌 대비). t일 종가로 정한 비중을 t+1일에 보유."""
+    ema = close.ewm(span=TSM_EMA, adjust=False, min_periods=TSM_EMA).mean()
+    on = (close > ema) & (close / close.shift(TSM_LOOKBACK) - 1 > 0)
+    vol = close.pct_change().rolling(TSM_VOL_WIN, min_periods=20).std()
+    raw = (TSM_TARGET_DAILY_VOL / vol).where(on, 0.0).fillna(0.0).clip(upper=TSM_MAX_WEIGHT)
+    gross = raw.sum(axis=1)
+    raw = raw.mul((TSM_MAX_GROSS / gross).where(gross > TSM_MAX_GROSS, 1.0), axis=0)
+    tgt = raw.to_numpy()
+    out = np.zeros_like(tgt)
+    for t in range(len(tgt)):
+        prev = out[t - 1] if t else np.zeros(tgt.shape[1])
+        change = (tgt[t] == 0) | (prev == 0) | (np.abs(tgt[t] - prev) > TSM_REBAL_BAND * np.maximum(prev, 1e-12))
+        out[t] = np.where(change, tgt[t], prev)
+    return pd.DataFrame(out, index=close.index, columns=close.columns)
+
+
+def tsm_backtest(close: pd.DataFrame, slip_pct: Optional[float] = None) -> Dict:
+    """일별 순수익(수수료·슬리피지·롱 펀딩비 차감) 시계열과 비중."""
+    w = tsm_weights(close)
+    rets = close.pct_change().fillna(0.0)
+    held = w.shift(1).fillna(0.0)
+    gross_ret = (held * rets).sum(axis=1)
+    turnover = (w - held).abs().sum(axis=1)
+    cost = turnover * (TAKER_FEE_PCT + (DEFAULT_SLIPPAGE_PCT if slip_pct is None else slip_pct)) / 100
+    funding = held.sum(axis=1) * TSM_FUNDING_DAILY
+    return {"daily": gross_ret - cost - funding, "gross": gross_ret, "weights": w}
+
+
+def perf_stats(daily: pd.Series) -> Dict:
+    """연수익률(복리), 연변동성, 샤프, 최대 낙폭, 누적 수익, 플러스 달 비율."""
+    d = daily.dropna()
+    if len(d) < 20:
+        return {"n_days": len(d)}
+    eq = (1 + d).cumprod()
+    years = len(d) / 365
+    monthly = (1 + d).groupby(d.index.to_period("M")).prod() - 1 if isinstance(d.index, pd.DatetimeIndex) else pd.Series(dtype=float)
+    sd = d.std()
+    return {"n_days": len(d), "total": float(eq.iloc[-1] - 1),
+            "cagr": float(eq.iloc[-1] ** (1 / years) - 1) if eq.iloc[-1] > 0 else -1.0,
+            "vol": float(sd * np.sqrt(365)), "sharpe": float(d.mean() / sd * np.sqrt(365)) if sd > 0 else 0.0,
+            "max_dd": float((eq / eq.cummax() - 1).min()),
+            "pos_months": float((monthly > 0).mean()) if len(monthly) else None}
+
+
+def _block_boot_p(x, block: int = 10, n_boot: int = 2000, seed: int = 11) -> float:
+    """일별 수익처럼 앞뒤가 이어진 데이터용 블록 부트스트랩: '평균 ≤ 0'일 확률."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < block * 3:
+        return 1.0
+    rng = np.random.default_rng(seed)
+    nb = int(np.ceil(n / block))
+    starts = rng.integers(0, n - block + 1, (n_boot, nb))
+    idx = (starts[:, :, None] + np.arange(block)).reshape(n_boot, -1)[:, :n]
+    return float((x[idx].mean(axis=1) <= 0).mean())
+
+
+def build_daily_portfolio(top_n: int = 30, balance: float = 1000.0) -> Dict:
+    """오늘(마지막 완성 일봉 기준)의 추세 포트폴리오: 신규 진입·유지·비중 조정·정리 목록."""
+    perps = bitget_perp_symbols() if BITGET_ONLY else set()
+    uni = build_universe(top_n, perps or None)
+    closes = {}
+    for sym, info in uni.items():
+        d = drop_unclosed(fetch_ohlcv(info["src"], sym, "1d", 200), "1d")
+        if d is not None and len(d) >= TSM_EMA + 10:
+            closes[sym] = d.set_index("ts")["close"]
+    if not closes:
+        raise RuntimeError("일봉 데이터를 받지 못했어요")
+    close = pd.DataFrame(closes).sort_index()
+    w = tsm_weights(close)
+    today, prev = w.iloc[-1], w.iloc[-2]
+    ema = close.ewm(span=TSM_EMA, adjust=False).mean().iloc[-1]
+    ret30 = (close.iloc[-1] / close.shift(TSM_LOOKBACK).iloc[-1] - 1)
+    rows = []
+    for sym in close.columns:
+        t_, p_ = float(today[sym]), float(prev[sym])
+        if t_ == 0 and p_ == 0:
+            continue
+        status = "신규 진입" if p_ == 0 else ("정리" if t_ == 0 else ("비중 조정" if abs(t_ - p_) > 1e-12 else "유지"))
+        info = uni.get(sym, {})
+        reason = ""
+        if status == "정리":
+            reason = ("종가가 50일선 아래로 마감" if close[sym].iloc[-1] <= ema[sym]
+                      else f"30일 수익률 마이너스({ret30[sym]:+.1%})")
+        rows.append({"symbol": sym, "status": status, "weight": t_, "prev_weight": p_, "reason": reason,
+                     "ret30": float(ret30[sym]) if pd.notna(ret30[sym]) else None,
+                     "notional": balance * t_, "close": float(close[sym].iloc[-1]), "exit_line": float(ema[sym]),
+                     "perp_symbol": info.get("perp", ""), "perp_mult": int(info.get("mult", 1))})
+    order = {"신규 진입": 0, "비중 조정": 1, "정리": 2, "유지": 3}
+    rows.sort(key=lambda r: (order[r["status"]], -r["weight"]))
+    return {"date": close.index[-1], "rows": rows, "gross": float(today.sum()), "n_hold": int((today > 0).sum()),
+            "coins": len(close.columns), "made_at": utc_now()}
+
+
+# ==========================================================================
+# 성장 시뮬레이터: 실제 거래 결과 분포를 다시 뽑아(부트스트랩) 앞으로의 계좌를 여러 번 시뮬레이션
+# ==========================================================================
+def simulation_source(tracks: List[Dict], ref: Optional[Dict]) -> tuple:
+    """성장 시뮬레이터에 쓸 거래 결과: 실전 추적 30건 이상 → 과거 검증 → 가정치 순.
+    반환 (R 목록, 출처 설명)."""
+    live = [t["R"] for t in tracks if t.get("status") == "종료" and t.get("R") is not None]
+    if len(live) >= 30:
+        return live, f"실전 추적 {len(live)}건"
+    if ref:
+        key = "immediate" if BREAKOUT_ENTRY == "immediate" and ref.get("immediate") else "base"
+        v = ref.get(key) or {}
+        if len(v.get("R", [])) >= 20:
+            return v["R"], f"과거 검증({'돌파 즉시 진입' if key == 'immediate' else '박스 돌파'}) {len(v['R'])}건"
+    rng = np.random.default_rng(3)  # 가정치: 승률 30%, 거래당 평균 약 +0.3R의 돌파형 분포
+    wins = rng.lognormal(np.log(3.33) - 0.405, 0.9, 300)
+    synth = np.where(rng.random(1000) < 0.3, rng.choice(wins, 1000), -rng.uniform(0.8, 1.1, 1000))
+    return list(synth), "가정치(승률 30%·거래당 약 +0.3R) — 연구실 실행 또는 실전 추적 30건 후 실제 값으로 바뀜"
+
+
+GOAL_USD = 500e8 / 1380          # 500억 원 ≈ 3,620만 달러 (환율 1,380원 가정)
+
+
+def growth_projection(R: List[float], trades_per_year: float, risk_pct: float, years: float,
+                      start: float, monthly_deposit: float = 0.0, n_sims: int = 2000,
+                      cap_start: float = 50_000, decay_per_double: float = 0.1, seed: int = 0) -> Dict:
+    """- 거래 결과: R 목록에서 무작위로 다시 뽑음(실제 분포의 두꺼운 꼬리 유지)
+    - 체결 한계: 계좌가 cap_start를 넘으면 두 배가 될 때마다 거래당 R이 decay_per_double씩 줄어듦
+    - 매달 monthly_deposit 추가 입금
+    반환: 연도별 하위10%/중앙값/상위10%, 목표(500억) 도달 확률, 고점 대비 90% 이상 손실 확률"""
+    R = np.asarray([r for r in R if r is not None], dtype=float)
+    if len(R) < 10:
+        raise ValueError("거래 결과가 10건 미만이라 시뮬레이션할 수 없어요")
+    rng = np.random.default_rng(seed)
+    k = max(1, int(trades_per_year * years))
+    per_month = max(trades_per_year / 12, 1e-9)
+    eq = np.full(n_sims, float(start))
+    peak, ruin, hit = eq.copy(), np.zeros(n_sims, bool), np.zeros(n_sims, bool)
+    f = risk_pct / 100
+    marks = {int(round(trades_per_year * y)): y for y in range(1, int(np.ceil(years)) + 1)}
+    marks[k] = years
+    out = {"year": [], "p10": [], "p50": [], "p90": []}
+    dep_every = per_month  # 거래 몇 건마다 한 달이 지나는지 (= 한 달 거래 수)
+    next_dep = dep_every
+    for i in range(1, k + 1):
+        adj = decay_per_double * np.maximum(0.0, np.log2(np.maximum(eq, 1e-9) / cap_start))
+        r = rng.choice(R, n_sims) - adj
+        eq = np.maximum(eq * (1 + f * r), 1e-6)
+        while monthly_deposit and i >= next_dep - 1e-6:
+            eq += monthly_deposit
+            next_dep += dep_every
+        peak = np.maximum(peak, eq)
+        ruin |= eq / peak <= 0.1
+        hit |= eq >= GOAL_USD
+        if i in marks:
+            out["year"].append(marks[i])
+            for q, key in ((10, "p10"), (50, "p50"), (90, "p90")):
+                out[key].append(float(np.percentile(eq, q)))
+    months = years * 12
+    return {**out, "hit": float(hit.mean()), "ruin": float(ruin.mean()),
+            "deposited": float(start + monthly_deposit * months), "n_trades": k, "avg_R": float(R.mean())}
+
+
+# ==========================================================================
+# 전략 연구실: 미리 정한 소수의 후보만, 개발 구간에서 비교하고 확인 구간에서 검증
+# ==========================================================================
+LAB_TAGS = ["squeeze", "htf_align", "alt_strong", "btc_strong", "strong_close"]
+LAB_VARIANTS = {"immediate": "돌파 즉시 진입", "donchian": "신고점 돌파(약 20일)"}
+LAB_ALPHA = 0.05  # 시험 후보 수로 나눠서 사용 (여러 개를 시험하면 우연히 좋아 보이는 게 나오기 때문)
+
+
+def _load_lab_data(n_coins: int, days: int, progress_cb=None) -> Dict:
+    """연구실용 과거 데이터: 과거를 가장 길게 주는 거래소 선택 → 거래량 구간별 균등 표본 → 코인·상위봉 데이터."""
+    bar_hours = pd.Timedelta(TIMEFRAME) / pd.Timedelta("1h")
+    warmup = 250 if TIMEFRAME == "4h" else 800
+    total_bars = int(days * 24 / bar_hours) + warmup
+    diag: Dict = {"요청 봉 수": total_bars}
+    ex_id, btc = None, None
+    for cand in EXCHANGES:
+        try:
+            b_ = fetch_extended_ohlcv(cand, f"BTC/{QUOTE}", TIMEFRAME, total_bars)
+        except Exception as e:
+            diag[f"{cand} BTC"] = f"실패({str(e)[:60]})"
+            continue
+        diag[f"{cand} BTC"] = f"{len(b_)}봉"
+        if len(b_) >= warmup + 100 and (btc is None or len(b_) > len(btc)):
+            ex_id, btc = cand, b_
+        if btc is not None and len(btc) >= 0.9 * total_bars:
+            break
+    if ex_id is None:
+        raise RuntimeError(f"과거 데이터를 받을 수 있는 거래소가 없어요 — 진단: {diag}")
+    perps = bitget_perp_symbols() if BITGET_ONLY else set()
+    universe = build_universe(TIER_BOUNDS[-1][2], perps or None)
+    diag.update(UNIVERSE_DIAG)
+    ranked = [x for x in universe if x != f"BTC/{QUOTE}"]
+    per = [n_coins // 3 + (1 if i < n_coins % 3 else 0) for i in range(3)]
+    cands: List[tuple] = []
+    for (label, a_, b_), k_ in zip(TIER_BOUNDS, per):
+        seg = ranked[a_:b_]
+        if seg and k_ > 0:
+            idx = np.linspace(0, len(seg) - 1, num=min(k_, len(seg))).round().astype(int)
+            cands += [(seg[j], label) for j in dict.fromkeys(idx.tolist())]
+    diag["표본"] = ", ".join(f"{lb} {sum(1 for _, t_ in cands if t_ == lb)}개" for lb, _, _ in TIER_BOUNDS)
+    if not cands:
+        raise RuntimeError(f"검증할 코인 후보가 없어요 — 진단: {diag}")
+    coins, errors = [], []
+    for k, (sym, tier) in enumerate(cands):
+        if progress_cb:
+            progress_cb(k, len(cands) * 2, f"데이터 받는 중 {sym}")
+        try:
+            d, htf = None, None
+            for src in dict.fromkeys([ex_id, universe.get(sym, {}).get("src", ex_id)]):
+                try:
+                    d = fetch_extended_ohlcv(src, sym, TIMEFRAME, total_bars)
+                except Exception:
+                    d = None
+                if d is not None and len(d) >= warmup + 100:
+                    htf = fetch_extended_ohlcv(src, sym, HTF_TIMEFRAME, _htf_bars_needed(total_bars) + 250)
+                    break
+            if d is None or htf is None:
+                errors.append(f"{sym}: 과거 데이터 부족")
+                continue
+            m = d.merge(btc[["ts", "close"]].rename(columns={"close": "btc_close"}), on="ts", how="inner")
+            if len(m) < warmup + 100:
+                errors.append(f"{sym}: BTC와 겹치는 기간 부족({len(m)}봉)")
+                continue
+            coins.append({"sym": sym, "tier": tier, "htf": htf,
+                          "df": m[["ts", "open", "high", "low", "close", "volume"]].reset_index(drop=True),
+                          "btc": pd.DataFrame({"ts": m["ts"], "close": m["btc_close"]}).reset_index(drop=True)})
+        except Exception as e:
+            errors.append(f"{sym}: {str(e)[:80]}")
+    start, end = btc["ts"].iloc[warmup], btc["ts"].iloc[-1]
+    if utc_now() - end > pd.Timedelta(TIMEFRAME) * 3:
+        diag["⚠️ 최근 데이터 누락"] = f"마지막 봉 {end:%Y-%m-%d %H:%M}"
+    return {"exchange": ex_id, "coins": coins, "errors": errors, "diag": diag, "warmup": warmup,
+            "start": start, "end": end, "days": days, "timeframe": TIMEFRAME}
+
+
+def _boot_p(a, b=None, n_boot: int = 3000, seed: int = 7) -> float:
+    """부트스트랩: '평균(a) − 평균(b) ≤ 0'일 확률 (b가 없으면 '평균(a) ≤ 0'일 확률). 작을수록 우연이 아님.
+    크립토 수익은 소수의 큰 거래에 쏠려 있어서 정규분포를 가정하는 t검정보다 이 방식이 안전함."""
+    a = np.asarray(a, dtype=float)
+    if len(a) < 5:
+        return 1.0
+    rng = np.random.default_rng(seed)
+    ma = rng.choice(a, (n_boot, len(a))).mean(axis=1)
+    if b is None:
+        return float((ma <= 0).mean())
+    b = np.asarray(b, dtype=float)
+    if len(b) < 5:
+        return 1.0
+    mb = rng.choice(b, (n_boot, len(b))).mean(axis=1)
+    return float((ma - mb <= 0).mean())
+
+
+def _rs(tr: List[Dict]) -> List[float]:
+    return [x["R"] for x in tr]
+
+
+def _avg(tr: List[Dict]) -> Optional[float]:
+    return float(np.mean(_rs(tr))) if tr else None
+
+
+def _tot(tr: List[Dict]) -> float:
+    return float(np.sum(_rs(tr))) if tr else 0.0
+
+
+def _ex_top5(tr: List[Dict]) -> Optional[float]:
+    r = sorted(_rs(tr), reverse=True)
+    return float(np.mean(r[5:])) if len(r) > 5 else None
+
+
+def _tiers_ok(tr: List[Dict], min_n: int = 10):
+    """표본이 min_n건 이상인 거래량 구간이 모두 플러스인지 (구간이 하나도 없으면 판단 불가 → False)."""
+    parts, ok_any, ok_all = [], False, True
+    for label, _, _ in TIER_BOUNDS:
+        v = [x for x in tr if x.get("tier") == label]
+        if len(v) >= min_n:
+            ok_any = True
+            ok_all &= _avg(v) > 0
+            parts.append(f"{label.replace('거래량 ', '')} {_avg(v):+.2f}")
+    return ok_any and ok_all, " / ".join(parts) or "표본 부족"
+
+
+def _split(tr: List[Dict], split_ts) -> tuple:
+    return [x for x in tr if x["entry_ts"] < split_ts], [x for x in tr if x["entry_ts"] >= split_ts]
+
+
+def _better(t: List[Dict], u: List[Dict], min_n: int = 5) -> bool:
+    """두 묶음 모두 min_n건 이상일 때만 '더 좋음'을 판단 (한쪽이 비면 비교 불가 → False)."""
+    return len(t) >= min_n and len(u) >= min_n and _avg(t) > _avg(u)
+
+
+def _verdict(checks: Dict[str, bool]) -> str:
+    if all(checks.values()):
+        return "✅ 통과"
+    core = [k for k in checks if k.startswith(("개발", "확인"))]
+    return "🟡 보류" if all(checks[k] for k in core) else "❌ 탈락"
+
+
+def run_strategy_lab(n_coins: int = 30, days: int = 730, progress_cb=None) -> Dict:
+    """전략 연구실 실행.
+    - 기준: 박스 돌파(리테스트 지정가 대기), 분할익절+추적손절
+    - 진입 방식 후보: 돌파 즉시 진입, 신고점 돌파(약 20일)
+    - 표시 후보: 변동성 수축, 일봉 방향 일치, 알트 지수 대비 강함, BTC 대비 강함, 강한 마감
+    - 기간의 앞 2/3 = 개발 구간(비교·선택), 뒤 1/3 = 확인 구간(선택 뒤 검증)
+    - 비용: 지정가 메이커 / 시장가·손절 테이커 + 거래량 구간별 슬리피지"""
+    data = _load_lab_data(n_coins, days, progress_cb)
+    coins = data["coins"]
+    alt = build_alt_index([c["df"] for c in coins if c["sym"].split("/")[0] not in ("BTC", "ETH")])
+    trades: Dict[str, List[Dict]] = {"base": [], "immediate": [], "donchian": []}
+    for k, c in enumerate(coins):
+        if progress_cb:
+            progress_cb(len(coins) + k, len(coins) * 2, f"검증 중 {c['sym']}")
+        df, slip = c["df"], SLIPPAGE_BY_TIER.get(c["tier"], DEFAULT_SLIPPAGE_PCT)
+        alt_al = align_to(df, alt)
+        sig = generate_signals(df, c["btc"], c["htf"], warmup=data["warmup"], alt_df=alt_al, families={"돌파"})
+        dsig = generate_donchian_signals(df, c["btc"], c["htf"], alt_al, warmup=data["warmup"])
+        runs = {"base": simulate_exits(df, sig, "partial_trail", entry_mode="retest", slip_pct=slip),
+                "immediate": simulate_exits(df, sig, "partial_trail", entry_mode="immediate", slip_pct=slip),
+                "donchian": simulate_exits(df, dsig, "partial_trail", slip_pct=slip)}
+        for key, tr in runs.items():
+            for x in tr:
+                x.update(symbol=c["sym"], tier=c["tier"], entry_ts=df["ts"].iloc[x["entry_idx"]],
+                         exit_ts=df["ts"].iloc[x["exit_idx"]])
+            trades[key] += tr
+    if progress_cb:
+        progress_cb(1, 1, "")
+    split_ts = data["start"] + (data["end"] - data["start"]) * 2 / 3
+    k_tests = len(LAB_TAGS) + len(LAB_VARIANTS) + 1  # +1: 추세 포트폴리오
+    alpha = LAB_ALPHA / k_tests
+    base = trades["base"]
+    bd, bh = _split(base, split_ts)
+    base_tier_ok, base_tier_txt = _tiers_ok(base)
+    baseline = {"dev_n": len(bd), "dev_avg": _avg(bd), "dev_tot": _tot(bd), "hold_n": len(bh),
+                "hold_avg": _avg(bh), "hold_tot": _tot(bh), "tiers": base_tier_txt, "ex_top5": _ex_top5(base),
+                "p": _boot_p(_rs(base)), "summary": summarize_trades(base)}
+    rows: List[Dict] = []
+    for key, name in LAB_VARIANTS.items():
+        v = trades[key]
+        vd, vh = _split(v, split_ts)
+        tier_ok, tier_txt = _tiers_ok(v)
+        ex5 = _ex_top5(v)
+        checks = {"개발: 기준보다 합계 R 큼": _tot(vd) > _tot(bd),
+                  "확인: 기준보다 합계 R 큼": _tot(vh) > _tot(bh),
+                  "확인: 평균 플러스": (_avg(vh) or 0) > 0,
+                  "거래량 구간 모두 플러스": tier_ok,
+                  "상위 5건 빼도 플러스": ex5 is not None and ex5 > 0,
+                  "표본 30건 이상(개발)": len(vd) >= 30,
+                  f"우연 확률 {alpha:.3f} 미만": _boot_p(_rs(v)) < alpha}
+        rows.append({"kind": "진입 방식", "key": key, "name": name, "dev": f"{len(vd)}건 {(_avg(vd) or 0):+.2f}R (합계 {_tot(vd):+.0f})",
+                     "hold": f"{len(vh)}건 {(_avg(vh) or 0):+.2f}R (합계 {_tot(vh):+.0f})", "tiers": tier_txt,
+                     "checks": checks, "verdict": _verdict(checks), "apply": "진입 방식 교체"})
+    for tag in LAB_TAGS:
+        tg = [x for x in base if tag in x.get("tags", [])]
+        un = [x for x in base if tag not in x.get("tags", [])]
+        td, th = _split(tg, split_ts)
+        ud, uh = _split(un, split_ts)
+        tier_ok, tier_txt = _tiers_ok(tg)
+        ex5 = _ex_top5(tg)
+        checks = {"개발: 표시 있음이 더 좋음": _better(td, ud),
+                  "확인: 표시 있음이 더 좋음": _better(th, uh),
+                  "확인: 평균 플러스": (_avg(th) or 0) > 0,
+                  "거래량 구간 모두 플러스": tier_ok,
+                  "상위 5건 빼도 플러스": ex5 is not None and ex5 > 0,
+                  "표본 충분(개발 30/15건)": len(td) >= 30 and len(ud) >= 15,
+                  f"우연 확률 {alpha:.3f} 미만": _boot_p(_rs(tg), _rs(un)) < alpha}
+        as_filter = (_avg(ud) or 0) <= 0 and (_avg(uh) or 0) <= 0
+        rows.append({"kind": "표시", "key": tag, "name": TAG_LABELS[tag],
+                     "dev": f"있음 {len(td)}건 {(_avg(td) or 0):+.2f}R / 없음 {len(ud)}건 {(_avg(ud) or 0):+.2f}R",
+                     "hold": f"있음 {len(th)}건 {(_avg(th) or 0):+.2f}R / 없음 {len(uh)}건 {(_avg(uh) or 0):+.2f}R",
+                     "tiers": tier_txt, "checks": checks, "verdict": _verdict(checks),
+                     "apply": "필터(표시 없으면 추천 안 함)" if as_filter else "우선순위(먼저 보여줌)"})
+    # ---- 추세 포트폴리오 (일봉, 거래량 1~60위 표본 코인, 롱 위주·매일 조정)
+    tsm = None
+    if HTF_TIMEFRAME == "1d":
+        closes = {c["sym"]: c["htf"].set_index("ts")["close"] for c in coins if c["tier"] != TIER_BOUNDS[-1][0]}
+        if len(closes) >= 5:
+            close = pd.DataFrame(closes).sort_index()
+            bt_ = tsm_backtest(close)
+            win = (bt_["daily"].index >= data["start"]) & (bt_["daily"].index <= data["end"])
+            daily = bt_["daily"][win]
+            ew = close.pct_change().mean(axis=1)[win].fillna(0.0)   # 같은 코인을 같은 비중으로 그냥 들고 있었다면
+            s_all, s_ew = perf_stats(daily), perf_stats(ew)
+            s_dev, s_hold = perf_stats(daily[daily.index < split_ts]), perf_stats(daily[daily.index >= split_ts])
+            fmt = lambda st_: (f"연 {st_['cagr']:+.0%} · 낙폭 {st_['max_dd']:.0%} · 샤프 {st_['sharpe']:.2f}"
+                               if st_.get("cagr") is not None else "표본 부족")
+            checks = {"개발: 수익 플러스": s_dev.get("total", -1) > 0,
+                      "확인: 수익 플러스": s_hold.get("total", -1) > 0,
+                      "확인: 샤프 0.5 이상": s_hold.get("sharpe", 0) >= 0.5,
+                      "최대 낙폭이 단순 보유보다 작음": s_all.get("max_dd", -1) > s_ew.get("max_dd", -1),
+                      f"우연 확률 {alpha:.3f} 미만": _block_boot_p(daily.to_numpy()) < alpha}
+            rows.append({"kind": "포트폴리오", "key": "tsm", "name": "추세 포트폴리오(매일 조정·롱)",
+                         "dev": fmt(s_dev), "hold": fmt(s_hold),
+                         "tiers": f"단순 보유: {fmt(s_ew)}", "checks": checks, "verdict": _verdict(checks),
+                         "apply": "오늘의 투자에 포트폴리오 표시"})
+            tsm = {"all": s_all, "dev": s_dev, "hold": s_hold, "ew": s_ew, "daily": daily, "ew_daily": ew,
+                   "coins": list(closes)}
+    months = max((data["end"] - data["start"]) / pd.Timedelta("30D"), 1e-9)
+    per_coin_month = {k: len(v) / max(len(coins), 1) / months for k, v in trades.items()}
+    passed = [r for r in rows if r["verdict"].startswith("✅")]
+    cfg = {"breakout_entry": "immediate" if any(r["key"] == "immediate" for r in passed) else "retest",
+           "donchian": any(r["key"] == "donchian" for r in passed),
+           "priority_tags": [r["key"] for r in passed if r["kind"] == "표시" and r["apply"].startswith("우선")],
+           "filter_tags": [r["key"] for r in passed if r["kind"] == "표시" and r["apply"].startswith("필터")],
+           "tsm": any(r["key"] == "tsm" for r in passed),
+           "baseline_ok": (baseline["dev_avg"] or 0) > 0 and (baseline["hold_avg"] or 0) > 0,
+           "made_at": str(utc_now()), "version": APP_VERSION, "timeframe": TIMEFRAME}
+    return {**{k: data[k] for k in ("exchange", "errors", "diag", "start", "end", "days", "timeframe")},
+            "coins": [c["sym"] for c in coins], "split_ts": split_ts, "k_tests": k_tests, "alpha": alpha,
+            "baseline": baseline, "rows": rows, "config": cfg, "trades": trades, "ran_at": utc_now(),
+            "per_coin_month": per_coin_month, "tsm": tsm}
+
+
+def run_strategy_lab_and_save(n_coins: int = 30, days: int = 730, progress_cb=None) -> Dict:
+    """연구실 실행 + 자동 방어 기준선 저장 (앱은 이 함수를 씀)."""
+    lab = run_strategy_lab(n_coins, days, progress_cb)
+    save_lab_reference(lab_reference_from(lab))
+    return lab
+
+
+def lab_frequency_text(lab: Dict, scan_n: Optional[int] = None) -> str:
+    """'스캔 N개 기준 한 달에 몇 건' 예상 (과거 거래 수 기준, 실제는 시장 상황에 따라 크게 달라짐)."""
+    n = scan_n or TOP_N_BY_VOLUME
+    pcm = lab.get("per_coin_month", {})
+    parts = [f"{name} 약 {pcm.get(key, 0) * n:.0f}건"
+             for key, name in (("base", "박스 돌파"), ("immediate", "돌파 즉시 진입"), ("donchian", "신고점 돌파"))]
+    return f"📅 스캔 {n}개 기준 한 달 예상 거래 수: " + " · ".join(parts)
+
+
+HOUR_GROUPS = {  # 1시간봉 '시작 시각'(한국시간) 기준
+    "4시간봉 마감 직전 1시간": [0, 4, 8, 12, 16, 20],
+    "4시간봉 마감 직후 1시간": [1, 5, 9, 13, 17, 21],
+    "마감 1시간 뒤 (02·06·10·14·18·22시~)": [2, 6, 10, 14, 18, 22],
+    "그 외 시간": [3, 7, 11, 15, 19, 23],
+}
+FUNDING_HOURS_KST = [1, 9, 17]  # Bitget 8시간 펀딩 정산 (코인마다 다를 수 있음)
+
+
+def hourly_volatility_profile(n_coins: int = 10, days: int = 60, progress_cb=None) -> Dict:
+    """한국시간 시간대별 평균 변동폭 (1시간봉 고가−저가).
+    코인마다, 시기마다 변동성 크기가 달라서 각 봉의 변동폭을 그 코인의 '직전 1주 평균'으로 나눠 비교(평균 = 1.0)."""
+    total = days * 24
+    perps = bitget_perp_symbols() if BITGET_ONLY else set()
+    uni = build_universe(30, perps or None)
+    syms = [f"BTC/{QUOTE}"] + [x for x in uni if x != f"BTC/{QUOTE}"][:max(n_coins - 1, 0)]
+    frames, used, errors = [], [], []
+    for k, sym in enumerate(syms):
+        if progress_cb:
+            progress_cb(k, len(syms), sym)
+        d = None
+        for ex_id in dict.fromkeys([x for x in [uni.get(sym, {}).get("src"), *EXCHANGES] if x]):
+            try:
+                d = fetch_extended_ohlcv(ex_id, sym, "1h", total)
+                if len(d) >= 24 * 14:
+                    break
+            except Exception:
+                d = None
+        if d is None or len(d) < 24 * 14:
+            errors.append(sym)
+            continue
+        tr = (d["high"] - d["low"]) / d["open"] * 100
+        rel = tr / tr.rolling(24 * 7, min_periods=24).mean().shift(1)
+        frames.append(pd.DataFrame({"hour": (d["ts"] + pd.Timedelta(hours=9)).dt.hour, "rel": rel}))
+        used.append(sym)
+    if progress_cb:
+        progress_cb(1, 1, "")
+    if not frames:
+        raise RuntimeError("1시간봉 데이터를 받지 못했어요 (네트워크·거래소 확인)")
+    allf = pd.concat(frames).replace([np.inf, -np.inf], np.nan).dropna()
+    allf = allf[allf["rel"] < 10]  # 극단적 이상치 제외
+    prof = allf.groupby("hour")["rel"].mean().reindex(range(24))
+    groups = {name: float(prof.loc[hs].mean()) for name, hs in HOUR_GROUPS.items()}
+    return {"profile": {int(h): float(v) for h, v in prof.items()}, "groups": groups,
+            "funding": float(prof.loc[FUNDING_HOURS_KST].mean()), "coins": used, "errors": errors,
+            "days": days, "bars": int(len(allf)), "ran_at": utc_now()}
+
+
+def hourly_vol_lines(hv: Dict) -> List[str]:
+    g = hv["groups"]
+    after1 = g["4시간봉 마감 직후 1시간"]
+    after2 = g["마감 1시간 뒤 (02·06·10·14·18·22시~)"]
+    lines = [f"{name}: 평균의 {v:.2f}배" for name, v in g.items()]
+    lines.append(f"펀딩 정산 직후(01·09·17시~): 평균의 {hv['funding']:.2f}배")
+    if after1 > after2 * 1.10:
+        lines.append(f"✅ 관찰이 맞아요: 마감 직후 1시간이 그 다음 1시간보다 약 {(after1 / after2 - 1) * 100:.0f}% 더 출렁여요. "
+                     f"마감 1시간 뒤에 확인·진입하는 게 덜 흔들린 가격을 보는 방법이에요.")
+    elif after1 > after2:
+        lines.append(f"🟡 마감 직후가 조금 더 출렁이지만 차이가 약 {(after1 / after2 - 1) * 100:.0f}%로 크지 않아요.")
+    else:
+        lines.append("ℹ️ 이 기간 데이터로는 마감 직후가 더 출렁인다는 차이가 보이지 않아요.")
+    prof = pd.Series(hv["profile"]).dropna()
+    calm = ", ".join(f"{h:02d}시" for h in prof.nsmallest(3).index)
+    wild = ", ".join(f"{h:02d}시" for h in prof.nlargest(3).index)
+    lines.append(f"가장 잠잠한 시간대: {calm} · 가장 출렁이는 시간대: {wild} (1시간봉 시작 시각, 한국시간)")
+    return lines
+
+
+def lab_config_text(cfg: Dict) -> str:
+    parts = ["돌파 진입: " + ("즉시 진입" if cfg.get("breakout_entry") == "immediate" else "리테스트 대기")]
+    if cfg.get("donchian"):
+        parts.append("신고점 돌파 추가")
+    if cfg.get("tsm"):
+        parts.append("추세 포트폴리오 켜짐")
+    if cfg.get("priority_tags"):
+        parts.append("우선 표시: " + ", ".join(TAG_LABELS[t] for t in cfg["priority_tags"]))
+    if cfg.get("filter_tags"):
+        parts.append("필수 표시: " + ", ".join(TAG_LABELS[t] for t in cfg["filter_tags"]))
+    return " · ".join(parts)
+
+
+def apply_lab_config(cfg: Dict, save: bool = True) -> None:
+    """연구실에서 통과한 항목을 실전 추천 설정에 반영 (앱의 '이 설정 적용' 버튼). 파일로도 저장."""
+    global BREAKOUT_ENTRY, PRIORITY_TAGS, FILTER_TAGS, TSM_ENABLED
+    BREAKOUT_ENTRY = cfg.get("breakout_entry", "retest")
+    TSM_ENABLED = bool(cfg.get("tsm"))
+    PRIORITY_TAGS = set(cfg.get("priority_tags", []))
+    FILTER_TAGS = set(cfg.get("filter_tags", []))
+    if cfg.get("donchian"):
+        ENABLED_FAMILIES.add("신고점 돌파")
+    if save:
+        try:
+            with open(LAB_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            print(f"[warn] 연구실 설정 저장 실패: {e}")
+
+
+def load_lab_config() -> Optional[Dict]:
+    """저장된 연구실 설정을 읽어 적용 (없으면 None). Streamlit Cloud는 앱이 재시작되면 파일이 지워질 수 있음."""
+    try:
+        with open(LAB_CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        apply_lab_config(cfg, save=False)
+        return cfg
+    except Exception:
+        return None
+
+
+def reset_lab_config() -> None:
+    apply_lab_config({"breakout_entry": "retest", "donchian": False, "priority_tags": [], "filter_tags": [], "tsm": False},
+                     save=False)
+    ENABLED_FAMILIES.discard("신고점 돌파")
+    try:
+        os.remove(LAB_CONFIG_FILE)
+    except Exception:
+        pass
+
+
+def lab_report_text(lab: Dict) -> str:
+    b = lab["baseline"]
+    lines = [f"[전략 연구실 {APP_VERSION}] {lab['exchange']} · {tf_label(lab['timeframe'])} · 코인 {len(lab['coins'])}개 · "
+             f"{pd.Timestamp(lab['start']):%Y-%m-%d} ~ {pd.Timestamp(lab['end']):%Y-%m-%d} "
+             f"(확인 구간 {pd.Timestamp(lab['split_ts']):%Y-%m-%d}~)",
+             "- 진단: " + ", ".join(f"{k} {v}" for k, v in lab["diag"].items()),
+             f"- 기준(박스 돌파·리테스트): 개발 {b['dev_n']}건 {(b['dev_avg'] or 0):+.2f}R / 확인 {b['hold_n']}건 "
+             f"{(b['hold_avg'] or 0):+.2f}R / 구간 {b['tiers']} / 상위5 제외 "
+             f"{(b['ex_top5'] if b['ex_top5'] is not None else float('nan')):+.2f}R / 우연 확률 {b['p']:.3f}"]
+    for r in lab["rows"]:
+        failed = [k for k, v in r["checks"].items() if not v]
+        lines.append(f"- {r['verdict']} {r['name']}: 개발 {r['dev']} | 확인 {r['hold']} | 구간 {r['tiers']}"
+                     + (f" | 미충족: {', '.join(failed)}" if failed else ""))
+    lines.append("- 추천 설정: " + lab_config_text(lab["config"]))
+    if lab.get("per_coin_month"):
+        lines.append("- " + lab_frequency_text(lab))
+    if lab["errors"]:
+        lines.append(f"- 제외된 코인 {len(lab['errors'])}개: " + " / ".join(lab["errors"][:6]))
+    return "\n".join(lines)
+
 
 
 def backtest_wfo_real(exchange_id: str, symbol: str, timeframe: Optional[str] = None,
@@ -2426,7 +3529,7 @@ def main(risk_cfg: Optional[RiskConfig] = None):
 
     def _rs_sort_key(s: CoinSetup):
         asym = s.asymmetry if s.asymmetry is not None else 0.0
-        if s.bias in ("long", "wait_breakout_long", "range_fade_long"):
+        if s.bias in LONG_BIASES:
             return (s.rs, asym)
         return (-s.rs, -asym)
 

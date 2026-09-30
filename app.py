@@ -9,6 +9,7 @@ app.py — 코인 추천 웹 화면 (핸드폰 우선)
 ⚠️ 참고용 화면입니다. 자동 주문 기능은 없습니다.
 """
 import contextlib
+import dataclasses
 import io
 import threading
 import traceback
@@ -32,13 +33,17 @@ def get_store() -> dict:
 
 
 store = get_store()
+for _k, _v in {"lab": None, "lab_error": None, "lab_cfg": None, "lab_cfg_loaded": False,
+               "force_rescan": False, "hvol": None, "hvol_error": None, "port": None, "port_key": None,
+               "port_error": None, "sim": None}.items():
+    store.setdefault(_k, _v)  # 앱이 켜진 채 코드만 바뀐 경우에도 새 항목이 생기도록
 
 
 def kst(ts) -> str:
     return (pd.Timestamp(ts) + pd.Timedelta(hours=9)).strftime("%H:%M")
 
 
-APP_VERSION = "2026-09-30 v5"
+APP_VERSION = "2026-09-30 v11"
 st.title("📈 코인 추천")
 _engine_ver = getattr(cmr, "APP_VERSION", None)
 st.caption(f"Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님) · 버전 {APP_VERSION}")
@@ -46,6 +51,17 @@ if _engine_ver != APP_VERSION:
     st.error(f"⚠️ 파일 버전이 맞지 않아요. 화면(app.py)은 {APP_VERSION}인데 분석 엔진(crypto_market_regime.py)은 "
              f"{_engine_ver or '이전 버전'}이에요. crypto_market_regime.py를 새 파일로 교체하고 앱을 재시작해주세요.")
     st.stop()
+
+# 전략 연구실에서 적용한 설정 불러오기 (저장 파일 → 한 번만), 매 실행마다 엔진에 반영
+if not store["lab_cfg_loaded"]:
+    store["lab_cfg"] = cmr.load_lab_config()
+    store["lab_cfg_loaded"] = True
+if store["lab_cfg"]:
+    cmr.apply_lab_config(store["lab_cfg"], save=False)
+if "pending_fams" in st.session_state:  # 연구실 설정 적용 직후 신호 유형 선택을 맞춤
+    st.session_state["fams"] = st.session_state.pop("pending_fams")
+if "pending_tsm" in st.session_state:
+    st.session_state["tsm_on"] = st.session_state.pop("pending_tsm")
 
 # ---------------------------------------------------------------- 설정
 with st.expander("⚙️ 설정"):
@@ -62,38 +78,54 @@ with st.expander("⚙️ 설정"):
     max_n = st.slider("같은 방향 동시 추천 최대 개수", 1, 15, 10, key="max_n",
                       help="알트코인은 BTC와 같이 움직여서, 같은 방향을 많이 잡아도 분산이 잘 안 됩니다")
     c5, c6 = st.columns(2)
-    top_n = c5.slider("스캔 코인 수 (3개 거래소 합산 거래량 순위)", 10, 150, 30, key="top_n",
+    top_n = c5.slider("스캔 코인 수 (3개 거래소 합산 거래량 순위)", 10, 150, 60, key="top_n",
                       help="과거 검증의 '거래량 구간별' 결과에서 플러스가 확인된 구간까지만 늘리세요. "
                            "바꾼 뒤 '새로 분석'을 눌러야 반영")
     live_sec = c6.selectbox("가격 자동 갱신(초)", [15, 30, 60], index=1, key="live_sec")
     tf_choice = st.radio("신호 봉", ["4시간봉 (기본)", "1시간봉 (비교용)"], horizontal=True, key="tf_choice")
     bitget_only = st.checkbox("Bitget 선물 거래 가능한 코인만", value=True, key="bitget_only")
-    fams = st.multiselect("추천할 신호 유형", ["돌파", "추세", "박스 역매매"], default=["돌파"], key="fams",
-                          help="2년 과거 검증(4시간봉)에서 돌파만 뚜렷한 플러스였어요. 추세·박스 역매매는 "
-                               "켤 수 있지만 근거가 약해요.")
+    _tsm_default = {} if "tsm_on" in st.session_state else {"value": bool((store["lab_cfg"] or {}).get("tsm"))}
+    c7, c8 = st.columns(2)
+    tsm_on = c7.checkbox("📈 추세 포트폴리오 표시", key="tsm_on",
+                         help="매일 일봉 마감 후 추세가 살아있는 코인을 변동성 비중으로 보유(롱). 연구실에서 통과하면 자동으로 켜져요",
+                         **_tsm_default)
+    port_n = c8.slider("포트폴리오 코인 수", 10, 40, 30, key="port_n", help="합산 거래량 상위 N개 중에서 고름")
+    auto_def = st.checkbox("🛡 자동 방어 (실전 성과가 나빠진 신호 유형은 리스크 절반 → 계속 나쁘면 자동 중지)",
+                           value=True, key="auto_def")
+    _fam_default = {} if "fams" in st.session_state else {
+        "default": ["돌파"] + (["신고점 돌파"] if (store["lab_cfg"] or {}).get("donchian") else [])}
+    fams = st.multiselect("추천할 신호 유형", ["돌파", "신고점 돌파", "추세", "박스 역매매"], key="fams",
+                          help="2년 과거 검증(4시간봉)에서 박스 돌파만 뚜렷한 플러스였어요. 신고점 돌파는 전략 연구실에서 "
+                               "통과했을 때만 켜는 걸 권해요. 추세·박스 역매매는 근거가 약해요.", **_fam_default)
+    if store["lab_cfg"]:
+        st.caption("🧪 연구실 적용 설정: " + cmr.lab_config_text(store["lab_cfg"]))
+        if st.button("연구실 설정 초기화"):
+            cmr.reset_lab_config()
+            store["lab_cfg"], store["force_rescan"] = None, True
+            st.rerun()
 
 tf = "1h" if tf_choice.startswith("1") else "4h"
 risk_cfg = cmr.RiskConfig(account_balance=balance, risk_per_trade_pct=risk_pct, max_concurrent_setups=max_n,
                           max_total_risk_pct=max_total, open_positions=int(open_pos))
-scan_cfg = (top_n, bitget_only, tf, tuple(sorted(fams)))
+scan_cfg = (top_n, bitget_only, tf, tuple(sorted(fams)), cmr.lab_config_text(store["lab_cfg"] or {}), auto_def)
 
 
-# ---------------------------------------------------------------- 과거 검증 화면
-def render_backtest() -> None:
-    st.caption("실제 과거 데이터로 지금 전략을 그대로 돌려봐요. 과거에 좋았다고 미래가 보장되진 않아요.")
+# ---------------------------------------------------------------- 전략 연구실 화면
+def render_lab() -> None:
+    st.caption("근거 있는 소수의 후보만 미리 정해두고, 과거의 앞 2/3(개발 구간)에서 비교한 뒤 뒤 1/3(확인 구간)으로 "
+               "한 번 더 확인해요. 모든 기준을 통과한 후보만 실전 추천에 적용할 수 있어요.")
     b1, b2 = st.columns(2)
-    n_coins = b1.slider("검증할 코인 수", 6, 30, 30, step=3, key="bt_n",
+    n_coins = b1.slider("검증할 코인 수", 9, 30, 30, step=3, key="lab_n",
                         help="거래량 1~30위·31~60위·61~100위에서 3분의 1씩 고르게 뽑아요")
-    period = b2.selectbox("기간", ["6개월", "1년", "2년"], index=1, key="bt_period")
-    days = {"6개월": 182, "1년": 365, "2년": 730}[period]
-    est_min = max(1, round(n_coins * (9 if tf == "4h" else 30) * days / 365 / 60))
-    st.caption(f"{cmr.tf_label(tf)} 기준 · 예상 소요 약 {est_min}분(데이터 받는 시간 포함 더 걸릴 수 있음) · "
-               "거래가 100건 이상이어야 믿을 만해요")
-    if st.button("▶ 검증 실행", type="primary", use_container_width=True):
+    period = b2.selectbox("기간", ["1년", "2년"], index=1, key="lab_period")
+    days = {"1년": 365, "2년": 730}[period]
+    est = max(1, round(n_coins * (6 if tf == "4h" else 20) * days / 365 / 60))
+    st.caption(f"{cmr.tf_label(tf)} 기준 · 예상 소요 약 {est}분 이상(데이터 받는 시간 포함) · 화면을 켜둔 채 기다려주세요")
+    if st.button("▶ 연구실 실행", type="primary", use_container_width=True):
         prog = st.progress(0.0, text="과거 데이터 받는 중...")
 
         def cb(i: int, n: int, sym: str) -> None:
-            prog.progress(min(i / max(n, 1), 1.0), text=f"검증 중 {i}/{n}  {sym}")
+            prog.progress(min(i / max(n, 1), 1.0), text=f"{sym}")
 
         with store["lock"]:
             cmr.BITGET_ONLY = bitget_only
@@ -101,65 +133,127 @@ def render_backtest() -> None:
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf):
-                    store["bt"] = cmr.run_backtest_suite(n_coins, days, cb)
-                store["bt_error"] = None
+                    store["lab"] = cmr.run_strategy_lab_and_save(n_coins, days, cb)
+                store["lab_error"] = None
             except Exception:
-                store["bt_error"] = traceback.format_exc() + "\n" + buf.getvalue()
+                store["lab_error"] = traceback.format_exc() + "\n" + buf.getvalue()
             finally:  # 추천 화면이 쓰는 봉 모드로 되돌림
                 r0 = store["result"]
                 cmr.set_timeframe(r0.get("timeframe", "4h") if r0 else "4h")
         prog.empty()
 
-    if store.get("bt_error"):
-        st.error("검증 중 오류가 발생했어요. 아래 내용을 그대로 복사해서 알려주세요.")
-        st.code(store["bt_error"], language=None)
-    bt = store.get("bt")
-    if not bt:
-        st.info("아직 실행한 검증이 없어요. 코인 수와 기간을 고르고 '▶ 검증 실행'을 눌러주세요.")
+    if store.get("lab_error"):
+        st.error("연구실 실행 중 오류가 발생했어요. 아래 내용을 그대로 복사해서 알려주세요.")
+        st.code(store["lab_error"], language=None)
+    lab = store.get("lab")
+    if not lab:
+        st.info("아직 실행한 결과가 없어요. 코인 수와 기간을 고르고 '▶ 연구실 실행'을 눌러주세요.")
         return
 
-    st.caption(f"{bt['exchange']} · {cmr.tf_label(bt['timeframe'])} · "
-               f"{pd.Timestamp(bt['start']):%Y-%m-%d} ~ {pd.Timestamp(bt['end']):%Y-%m-%d} · "
-               f"코인 {len(bt['coins'])}개 · 실행 {kst(bt['ran_at'])}")
-    actual = bt.get("days_actual", bt["days"])
-    if actual < 0.9 * bt["days"]:
-        st.warning(f"요청한 {bt['days']}일 중 실제로는 {actual}일치만 받을 수 있었어요 "
-                   f"(거래소가 제공하는 과거 데이터 한도). 결과는 이 기간 기준이에요.")
-    st.dataframe(cmr.backtest_mode_table(bt), hide_index=True, use_container_width=True)
-    lines = cmr.interpret_backtest(cmr.summarize_trades(bt["trades"]["partial_trail"]), risk_pct)
-    cmp_line = cmr.compare_modes_line(bt)
-    st.markdown("\n".join(f"- {x}" for x in lines + ([cmp_line] if cmp_line else [])))
+    st.caption(f"{lab['exchange']} · {cmr.tf_label(lab['timeframe'])} · "
+               f"{pd.Timestamp(lab['start']):%Y-%m-%d} ~ {pd.Timestamp(lab['end']):%Y-%m-%d} · "
+               f"확인 구간 {pd.Timestamp(lab['split_ts']):%Y-%m-%d}~ · 코인 {len(lab['coins'])}개 · "
+               f"시험 후보 {lab['k_tests']}개(우연 확률 기준 {lab['alpha']:.3f} 미만)")
+    b = lab["baseline"]
+    st.markdown(f"**기준 전략 (박스 돌파 · 리테스트 대기)** — 개발 {b['dev_n']}건 {(b['dev_avg'] or 0):+.2f}R · "
+                f"확인 {b['hold_n']}건 {(b['hold_avg'] or 0):+.2f}R · 거래량 구간 {b['tiers']}")
+    if not lab["config"]["baseline_ok"]:
+        st.warning("기준 전략이 개발·확인 구간 중 한쪽에서 마이너스예요. 실전 투입은 보류하고 모의로 지켜보는 걸 권해요.")
+    rows = [{"판정": r["verdict"], "후보": r["name"], "종류": r["kind"], "개발 구간": r["dev"], "확인 구간": r["hold"],
+             "거래량 구간": r["tiers"], "통과 시 적용": r["apply"],
+             "미충족 기준": ", ".join(k for k, v in r["checks"].items() if not v) or "-"} for r in lab["rows"]]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption("✅ 통과: 모든 기준 충족 · 🟡 보류: 개발·확인 구간 모두 방향은 맞지만 표본·우연 확률 등 기준 미달 · ❌ 탈락")
 
-    t1, t4, t5, t2, t3 = st.tabs(["유형·방향", "구간·변동성", "돌파 점검", "코인별", "📋 복사용"])
-    tr = bt["trades"]["partial_trail"]
-    with t1:
-        st.caption("분할익절+추적손절 기준")
-        st.dataframe(cmr.backtest_group_table(tr, "family"), hide_index=True, use_container_width=True)
-        st.dataframe(cmr.backtest_group_table(tr, "direction"), hide_index=True, use_container_width=True)
-    with t4:
-        st.caption("거래량 구간별: 스캔 코인 수를 어디까지 늘려도 되는지 판단하는 표")
-        st.dataframe(cmr.backtest_group_table(tr, "tier"), hide_index=True, use_container_width=True)
-        st.markdown(cmr.suggest_scan_count(tr, set(fams) or None))
-        st.caption("진입 시점 변동성별(가격 대비 ATR): 변동성이 낮은 코인은 손절폭이 좁아 비용 비중이 커져요")
-        st.dataframe(cmr.backtest_group_table(tr, "vol"), hide_index=True, use_container_width=True)
-    with t5:
-        st.markdown("\n".join(f"- {x}" for x in cmr.family_check_lines(cmr.family_check(tr, "돌파"))))
-    with t2:
-        st.caption("분할익절+추적손절 기준 · 합계 R 순")
-        st.dataframe(cmr.backtest_group_table(tr, "symbol"), hide_index=True, use_container_width=True)
+    if lab.get("per_coin_month"):
+        st.caption(cmr.lab_frequency_text(lab, top_n) + " (과거 기준 예상치, 시장 상황에 따라 크게 달라져요)")
+    st.caption("🛡 이 결과의 신호 유형별 성과가 자동 방어 기준선으로 저장됐어요. 실전 추적 성과가 이 기준 아래로 "
+               "떨어지면 추천이 자동으로 감축·중지돼요.")
+    cfg = lab["config"]
+    if any(r["verdict"].startswith("✅") for r in lab["rows"]):
+        st.markdown("**추천 설정:** " + cmr.lab_config_text(cfg))
+        if st.button("✔ 이 설정 적용", use_container_width=True):
+            cmr.apply_lab_config(cfg)
+            store["lab_cfg"], store["force_rescan"] = cfg, True
+            if cfg.get("donchian"):
+                st.session_state["pending_fams"] = sorted(set(st.session_state.get("fams", ["돌파"])) | {"신고점 돌파"})
+            if cfg.get("tsm"):
+                st.session_state["pending_tsm"] = True
+            st.rerun()
+    else:
+        st.info("통과한 후보가 없어요. 지금 설정(박스 돌파 · 리테스트 대기)을 그대로 쓰는 게 근거에 맞아요.")
+
+    t1, t3, t2 = st.tabs(["기준 전략 상세", "추세 포트폴리오", "📋 복사용"])
     with t3:
-        st.caption("이 내용을 복사해서 보내주시면 결과를 해석하고 기준을 조정해 드릴게요.")
-        st.code(cmr.backtest_report_text(bt, risk_pct), language=None)
-    if bt["errors"]:
-        st.caption("제외된 코인: " + " · ".join(bt["errors"][:10]))
-    st.caption("ⓘ 스프레드·펀딩비·거래대금 필터는 과거 기록이 없어 검증에 반영되지 않았어요. "
-               "그리고 이 결과에 맞춰 기준을 여러 번 바꾸면 과거에만 맞는 전략이 되기 쉬우니, "
-               "기준을 바꿨다면 다른 기간(예: 6개월 → 2년)으로 다시 확인하세요.")
+        tsm_ = lab.get("tsm")
+        if tsm_:
+            st.caption(f"표본 코인 {len(tsm_['coins'])}개(거래량 1~60위)를 일봉으로 매일 점검 · 수수료·슬리피지·롱 펀딩비 차감 후")
+            curve = pd.DataFrame({"추세 포트폴리오": (1 + tsm_["daily"]).cumprod(),
+                                  "같은 코인 단순 보유": (1 + tsm_["ew_daily"]).cumprod()})
+            st.line_chart(curve)
+            a_, e_ = tsm_["all"], tsm_["ew"]
+            st.markdown(f"- 추세 포트폴리오: 연 {a_['cagr']:+.0%} · 최대 낙폭 {a_['max_dd']:.0%} · 샤프 {a_['sharpe']:.2f} · "
+                        f"플러스 달 {(a_.get('pos_months') or 0):.0%}\n"
+                        f"- 단순 보유: 연 {e_['cagr']:+.0%} · 최대 낙폭 {e_['max_dd']:.0%} · 샤프 {e_['sharpe']:.2f}")
+        else:
+            st.write("추세 포트폴리오는 4시간봉 모드에서 일봉 데이터로 검증해요.")
+    base_tr = lab["trades"]["base"]
+    with t1:
+        st.caption("기준 전략(박스 돌파) 거래를 거래량 구간·방향·진입 시점 변동성으로 나눠 본 결과")
+        for by in ("tier", "direction", "vol"):
+            st.dataframe(cmr.backtest_group_table(base_tr, by), hide_index=True, use_container_width=True)
+        st.markdown(cmr.suggest_scan_count(base_tr, {"돌파"}))
+    with t2:
+        st.caption("이 내용을 복사해서 보내주시면 결과를 해석해 드릴게요.")
+        st.code(cmr.lab_report_text(lab), language=None)
+    st.caption("ⓘ 스프레드·펀딩비 필터는 과거 기록이 없어 반영되지 않았어요. 후보를 결과에 맞춰 계속 바꾸면 과거에만 맞는 "
+               "전략이 되기 쉬우니, 적용한 뒤에는 최소 4주 소액·모의로 실제 결과를 확인하세요.")
 
 
-page = st.radio("화면", ["📋 추천", "🧪 과거 검증"], horizontal=True, key="page", label_visibility="collapsed")
-if page.endswith("과거 검증"):
-    render_backtest()
+def render_hourly_vol() -> None:
+    st.markdown("#### 🕐 시간대별 변동성")
+    st.caption("1시간봉으로 한국시간 시간대별 평균 변동폭을 재요. 코인·시기마다 변동성 크기가 달라서, 각 봉을 그 코인의 "
+               "직전 1주 평균 변동폭으로 나눈 값(평균 = 1.0)으로 비교해요. 확인·진입하기 좋은 시간을 고르는 참고용이에요.")
+    h1, h2 = st.columns(2)
+    hv_n = h1.slider("분석 코인 수", 5, 20, 10, key="hv_n", help="BTC + 거래량 상위 코인")
+    hv_days = h2.selectbox("기간", [30, 60, 90], index=1, key="hv_days", format_func=lambda d: f"최근 {d}일")
+    if st.button("▶ 시간대 분석", use_container_width=True):
+        prog = st.progress(0.0, text="1시간봉 받는 중...")
+
+        def cb(i: int, n: int, sym: str) -> None:
+            prog.progress(min(i / max(n, 1), 1.0), text=f"{sym}")
+
+        with store["lock"]:
+            cmr.BITGET_ONLY = bitget_only
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    store["hvol"] = cmr.hourly_volatility_profile(hv_n, hv_days, cb)
+                store["hvol_error"] = None
+            except Exception:
+                store["hvol_error"] = traceback.format_exc() + "\n" + buf.getvalue()
+        prog.empty()
+    if store.get("hvol_error"):
+        st.error("시간대 분석 중 오류가 발생했어요. 아래 내용을 그대로 복사해서 알려주세요.")
+        st.code(store["hvol_error"], language=None)
+    hv = store.get("hvol")
+    if not hv:
+        return
+    st.caption(f"코인 {len(hv['coins'])}개 · 최근 {hv['days']}일 · 1시간봉 {hv['bars']:,}개 · 분석 {kst(hv['ran_at'])}")
+    chart = pd.DataFrame({"변동폭 (평균=1)": [hv["profile"][h] for h in range(24)]},
+                         index=[f"{h:02d}시" for h in range(24)])
+    st.bar_chart(chart)
+    st.markdown("\n".join(f"- {x}" for x in cmr.hourly_vol_lines(hv)))
+    st.caption("ⓘ 막대의 시각은 1시간봉이 '시작하는' 한국시간이에요. 예) 01시 막대 = 01:00~02:00. "
+               "4시간봉은 01·05·09·13·17·21시에 마감돼요.")
+
+
+page = st.radio("화면", ["📅 오늘의 투자", "📋 추천", "🧪 전략 연구실"], horizontal=True, key="page",
+                label_visibility="collapsed")
+if page.endswith("전략 연구실"):
+    render_lab()
+    st.divider()
+    render_hourly_vol()
     st.stop()
 
 
@@ -178,6 +272,7 @@ def run_scan(force: bool) -> None:
         cmr.TOP_N_BY_VOLUME = top_n
         cmr.BITGET_ONLY = bitget_only
         cmr.ENABLED_FAMILIES = set(fams)
+        cmr.AUTO_DEFENSE = auto_def
         cmr.set_timeframe(tf)
         buf = io.StringIO()
         try:
@@ -193,8 +288,10 @@ def run_scan(force: bool) -> None:
 top_l, top_r = st.columns([3, 2])
 refresh = top_r.button("🔄 새로 분석", type="primary", use_container_width=True)
 cur = store["result"]
-if refresh or cur is None or cmr.needs_full_rescan(cur.get("asof_utc"), cur.get("timeframe")):
-    run_scan(force=refresh)
+forced = refresh or store.get("force_rescan", False)
+if forced or cur is None or cmr.needs_full_rescan(cur.get("asof_utc"), cur.get("timeframe")):
+    store["force_rescan"] = False
+    run_scan(force=forced)
 
 res = store["result"]
 if store["error"]:
@@ -230,7 +327,7 @@ if breaker:
 # ---------------------------------------------------------------- 추천 (가격만 자동 갱신)
 def live_refresh_if_due() -> None:
     r = store["result"]
-    if not r or not r.get("all_setups"):
+    if not r or not (r.get("all_setups") or (r.get("filter_stats") or {}).get("watchlist")):
         return
     last = store.get("live_at")
     if last is not None and (cmr.utc_now() - last).total_seconds() < live_sec:
@@ -241,6 +338,9 @@ def live_refresh_if_due() -> None:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             cmr.refresh_live_status(r["all_setups"])
+            wl = (r.get("filter_stats") or {}).get("watchlist") or []
+            if wl:
+                cmr.refresh_watch_prices(wl[:30])
         store["live_at"], store["live_log"] = cmr.utc_now(), buf.getvalue()
     except Exception:
         store["live_log"] = traceback.format_exc()
@@ -250,8 +350,10 @@ def live_refresh_if_due() -> None:
 
 def render(items: list, slots: int = 10 ** 6) -> None:
     for k, s in enumerate(items):
-        sizing = cmr.calculate_position_size(s.entry_price, s.sl, risk_cfg)
-        st.markdown(L.card_html(s, sizing, risk_pct, over_limit=k >= slots), unsafe_allow_html=True)
+        mult = getattr(s, "risk_mult", 1.0) or 1.0  # 자동 방어 '주의'면 0.5
+        rc = dataclasses.replace(risk_cfg, risk_per_trade_pct=risk_pct * mult)
+        sizing = cmr.calculate_position_size(s.entry_price, s.sl, rc)
+        st.markdown(L.card_html(s, sizing, risk_pct * mult, over_limit=k >= slots), unsafe_allow_html=True)
         with st.expander("📋 주문 메모 (복사)"):
             st.code(L.order_memo(s, sizing, L.leverage_guide(s.entry_price, s.sl)), language=None)
 
@@ -264,8 +366,15 @@ def recommendations() -> None:
         st.rerun()
     live_refresh_if_due()
     r = store["result"]
+    paused = [s for s in r["all_setups"] if getattr(s, "health", "") == "paused"]
+    active_all = [s for s in r["all_setups"] if getattr(s, "health", "") != "paused"]
     with contextlib.redirect_stdout(io.StringIO()):
-        setups = cmr.cap_correlated_exposure(r["all_setups"], risk_cfg) if r["all_setups"] else []
+        setups = cmr.cap_correlated_exposure(active_all, risk_cfg) if active_all else []
+    for fam_, h_ in (r.get("health") or {}).items():
+        if h_.get("state") == "paused":
+            st.error(f"⏸ 자동 중지: '{fam_}' 신호 — {h_['reason']}. 성과가 회복되면 자동으로 다시 추천돼요.")
+        elif h_.get("state") == "caution":
+            st.warning(f"🛡 자동 방어: '{fam_}' 신호 — {h_['reason']}.")
     dead = [s for s in setups if s.live_status in ("invalid", "missed")]
     alive = [s for s in setups if s.live_status not in ("invalid", "missed")]
     ready = sorted([s for s in alive if s.live_status != "chase"], key=L.sort_key, reverse=True)
@@ -281,7 +390,7 @@ def recommendations() -> None:
         st.caption(f"🎯 새로 잡을 수 있는 포지션 {slots}개 (총 리스크 상한 {max_total:g}%, 보유 {int(open_pos)}개)")
 
     if not alive:
-        rare = " 돌파 신호는 원래 드물어서(코인 30개 기준 한 달에 몇 건 수준) 비어 있는 날이 많아요." \
+        rare = " 돌파 신호는 원래 드물어서 비어 있는 날이 많아요. 아래 '돌파 임박 관찰'에서 곧 신호가 날 수 있는 코인을 확인하세요." \
             if set(fams) == {"돌파"} else ""
         st.info("**지금은 조건에 맞는 코인이 없어요.**\n\n"
                 "켜둔 신호 유형에서 손익비·상위추세·펀딩비·스프레드 조건을 모두 통과한 코인이 없다는 뜻입니다."
@@ -305,12 +414,161 @@ def recommendations() -> None:
         with st.expander(f"❌ 무효·놓침 ({len(dead)}) — 다음 봉 마감 때 목록에서 정리돼요"):
             for s in dead:
                 st.markdown(L.dead_line(s), unsafe_allow_html=True)
+    if paused:
+        with st.expander(f"⏸ 자동 중지된 신호 ({len(paused)}) — 참고용, 진입 대상 아님"):
+            st.caption("최근 실전 성과가 기준 아래로 떨어진 유형이에요. 결과는 계속 추적하고, 회복되면 자동으로 다시 추천돼요.")
+            for s in paused:
+                st.markdown(L.paused_line(s), unsafe_allow_html=True)
+    watch = (r.get("filter_stats") or {}).get("watchlist") or []
+    if watch:
+        with st.expander(f"👀 돌파 임박 관찰 ({len(watch)}) — 아직 진입 신호 아님", expanded=not alive):
+            st.caption("유효한 박스의 경계에 1 ATR 이내로 붙은 코인이에요. 봉이 거래량과 함께 경계 밖에서 마감하면 "
+                       "위 추천 목록으로 올라와요. 미리 알림을 걸어두고 기다리세요.")
+            for w in watch[:15]:
+                st.markdown(L.watch_line(w), unsafe_allow_html=True)
+
+
+def render_portfolio_section() -> None:
+    st.markdown("#### ② 추세 포트폴리오 조정")
+    if not tsm_on:
+        st.info("추세 포트폴리오는 꺼져 있어요. 전략 연구실에서 통과하면 자동으로 켜지고, 설정에서 직접 켤 수도 있어요.")
+        return
+    if not (store["lab_cfg"] or {}).get("tsm"):
+        st.caption("⚠️ 연구실 검증을 통과하지 않은 상태에서 켠 거예요. 참고용으로 보세요.")
+    day_key = (str(cmr.current_candle_start("1d")), port_n, round(balance, 2))
+    if store.get("port_key") != day_key:
+        with st.spinner("일봉으로 포트폴리오 계산 중..."):
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    store["port"] = cmr.build_daily_portfolio(port_n, balance)
+                store["port_key"], store["port_error"] = day_key, None
+            except Exception:
+                store["port_error"] = traceback.format_exc() + "\n" + buf.getvalue()
+    if store.get("port_error"):
+        st.error("포트폴리오 계산 중 오류가 발생했어요. 아래 내용을 그대로 복사해서 알려주세요.")
+        st.code(store["port_error"], language=None)
+        return
+    pf = store.get("port")
+    if not pf:
+        return
+    act = [r for r in pf["rows"] if r["status"] != "유지"]
+    keep = [r for r in pf["rows"] if r["status"] == "유지"]
+    st.caption(f"기준 일봉 {pd.Timestamp(pf['date']):%m-%d} · 코인 {pf['coins']}개 중 보유 {pf['n_hold']}개 · "
+               f"비중 합계 {pf['gross']:.0%} (계좌 {balance:,.0f} USDT 기준)")
+    if act:
+        for r in act:
+            st.markdown(L.portfolio_line(r), unsafe_allow_html=True)
+    else:
+        st.write("오늘은 조정할 포지션이 없어요. 보유 중인 코인을 그대로 두세요.")
+    if keep:
+        with st.expander(f"⚪ 그대로 유지 ({len(keep)})"):
+            for r in keep:
+                st.markdown(L.portfolio_line(r), unsafe_allow_html=True)
+    st.caption("ⓘ 보유 조건은 두 가지예요: 종가가 50일선 위, 그리고 30일 수익률 플러스. 둘 중 하나라도 깨지면 다음 날 '정리'로 올라와요. "
+               "포트폴리오 비중은 박스 돌파 신호의 리스크 한도와 별개라, 둘을 합친 전체 포지션 규모를 함께 확인하세요.")
+
+
+def render_simulator() -> None:
+    with st.expander("📈 성장 시뮬레이터 — 지금 페이스면 몇 년 뒤 얼마일까"):
+        R_, src = cmr.simulation_source(cmr.load_tracks(), cmr.load_lab_reference())
+        ref_ = cmr.load_lab_reference() or {}
+        pcm = (ref_.get("per_coin_month") or {}).get("immediate" if cmr.BREAKOUT_ENTRY == "immediate" else "base")
+        default_tpy = int(round(pcm * top_n * 12)) if pcm else 150
+        g1, g2 = st.columns(2)
+        dep = g1.number_input("월 추가 입금 (USDT)", min_value=0.0, value=0.0, step=50.0, key="sim_dep")
+        until = g2.selectbox("기간", ["2030년 말", "2032년 말"], index=1, key="sim_until")
+        g3, g4 = st.columns(2)
+        tpy = g3.number_input("연간 거래 수", min_value=10, max_value=1000, value=max(10, default_tpy), step=10, key="sim_tpy",
+                              help="기본값은 연구실 결과의 예상 빈도 × 스캔 코인 수. 1일 1거래면 365")
+        rk = g4.number_input("거래당 리스크 (%)", min_value=0.1, max_value=5.0, value=float(risk_pct), step=0.1, key="sim_rk")
+        st.caption(f"거래 결과 출처: {src}")
+        if st.button("▶ 시뮬레이션", use_container_width=True):
+            end = pd.Timestamp("2030-12-31" if until.startswith("2030") else "2032-12-31")
+            years = max((end - pd.Timestamp.now()) / pd.Timedelta("365.25D"), 0.25)
+            with st.spinner("계산 중..."):
+                store["sim"] = {"out": cmr.growth_projection(R_, tpy, rk, years, balance, dep), "years": years,
+                                "until": until, "tpy": tpy, "rk": rk, "dep": dep, "src": src}
+        sim = store.get("sim")
+        if not sim:
+            return
+        o = sim["out"]
+        yrs = [f"{y:.2f}년 후" if y != int(y) else f"{int(y)}년 후" for y in o["year"]]
+        st.dataframe(pd.DataFrame({"시점": yrs, "하위 10%": [f"${x:,.0f}" for x in o["p10"]],
+                                   "중앙값": [f"${x:,.0f}" for x in o["p50"]], "상위 10%": [f"${x:,.0f}" for x in o["p90"]]}),
+                     hide_index=True, use_container_width=True)
+        st.markdown(f"- {sim['until']}까지 거래 {o['n_trades']:,}건 · 입금 총액 ${o['deposited']:,.0f}\n"
+                    f"- 목표(500억 원 ≈ ${cmr.GOAL_USD / 1e6:.1f}M) 도달 확률 **{o['hit']:.1%}** · "
+                    f"한때 고점 대비 90% 이상 잃을 확률 **{o['ruin']:.1%}**")
+        st.caption("ⓘ 거래 결과를 실제 분포에서 다시 뽑아 2,000번 시뮬레이션해요. 계좌가 5만 달러를 넘으면 알트코인 체결 한계로 "
+                   "거래당 성과가 조금씩 줄어드는 것까지 반영했어요. 과거·최근 성과가 앞으로도 이어진다는 가정이라 참고용이에요.")
+
+
+def render_today() -> None:
+    now_kst = pd.Timestamp.now(tz="UTC").tz_localize(None) + pd.Timedelta(hours=9)
+    st.markdown(f"### 📅 {now_kst:%m월 %d일} 오늘의 투자")
+    st.caption(f"권장 확인: 매일 10시(필수) · 14·18·22시(가능할 때) — 4시간봉 마감 1시간 뒤 · "
+               f"다음 신호 갱신 {kst(cmr.next_candle_close(res_tf))}")
+    live_refresh_if_due()
+    r = store["result"]
+    st.markdown("#### ① 오늘 진입할 신호")
+    active_all = [s for s in r["all_setups"] if getattr(s, "health", "") != "paused"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        setups = cmr.cap_correlated_exposure(active_all, risk_cfg) if active_all else []
+    ready = sorted([s for s in setups if s.live_status == "ready"], key=L.sort_key, reverse=True)
+    waiting = [s for s in setups if s.live_status == "chase"]
+    slots = cmr.available_slots(risk_cfg)
+    if ready and slots > 0:
+        st.caption(f"우선순위 순 · 리스크 한도 안에서 새로 잡을 수 있는 포지션 {slots}개")
+        render(ready[:slots])
+        if len(ready) > slots:
+            st.caption(f"한도 밖 {len(ready) - slots}개는 '📋 추천' 화면에서 참고용으로 볼 수 있어요.")
+    elif ready:
+        st.warning("진입 신호가 있지만 총 리스크 한도에 도달했어요. 기존 포지션이 정리된 뒤에 검토하세요.")
+    else:
+        st.write("오늘은 새로 진입할 신호가 없어요." + (f" 지정가 대기 중인 신호 {len(waiting)}개는 '📋 추천' 화면에서 "
+                                              "지정가를 걸어두세요." if waiting else ""))
+    render_portfolio_section()
+    st.markdown("#### ③ 알림 걸어둘 코인")
+    watch = (r.get("filter_stats") or {}).get("watchlist") or []
+    if watch:
+        st.caption("거래소 앱에서 경계 가격에 가격 알림을 걸어두세요. 경계 밖에서 봉이 마감하면 신호로 올라와요.")
+        for w in watch[:5]:
+            st.markdown(L.watch_line(w), unsafe_allow_html=True)
+    else:
+        st.write("지금 박스 경계에 붙어 있는 코인이 없어요.")
+    st.markdown("#### ④ 체크리스트")
+    st.markdown("- 진입했다면 **손절 주문을 거래소에 바로 등록**했나요?\n"
+                "- 보유 포지션 수를 설정의 '지금 보유 중인 포지션 수'에 반영했나요?\n"
+                "- 어제 청산한 거래를 '📋 추천' 화면 아래 '매매 결과 기록'에 적었나요? (서킷브레이커용)\n"
+                "- 자동 방어 경고(⚠️·⏸)가 있으면 그 유형은 비중을 줄이거나 쉬세요.")
+    render_simulator()
 
 
 fragment = getattr(st, "fragment", None)
+if page.endswith("오늘의 투자"):
+    render_today()
+    st.stop()
 if fragment is not None:
     recommendations = fragment(run_every=live_sec)(recommendations)
 recommendations()
+
+# ---------------------------------------------------------------- 실전 추천 자동 추적
+_tracks = cmr.load_tracks()
+if _tracks:
+    with st.expander(f"📈 실전 추천 추적 ({len(_tracks)}건)"):
+        st.caption("앱이 낸 추천을 '그대로 모두 진입했다면'으로 가정하고, 이후 실제 완성봉으로 체결·손절·익절 결과를 "
+                   "자동 계산해요. 과거 검증이 아니라 지금 시장에서의 성과예요.")
+        rows_, notes_ = cmr.tracking_summary(_tracks, cmr.load_lab_reference())
+        if rows_:
+            st.dataframe(pd.DataFrame(rows_), hide_index=True, use_container_width=True)
+        for n_ in notes_:
+            st.markdown(f"- {n_}")
+        recent = [{"코인": t["symbol"], "유형": t["family"], "방향": "롱" if t["direction"] == "long" else "숏",
+                   "신호(한국시간)": (pd.Timestamp(t["signal_ts"]) + pd.Timedelta(hours=9)).strftime("%m-%d %H:%M"),
+                   "상태": t["status"], "R": t.get("R")} for t in reversed(_tracks[-12:])]
+        st.dataframe(pd.DataFrame(recent), hide_index=True, use_container_width=True)
+        st.caption("ⓘ 실제 체결 가격·시점과는 조금 다를 수 있어요. Streamlit Cloud는 앱이 재시작되면 기록이 지워질 수 있어요.")
 
 # ---------------------------------------------------------------- 부가 기능
 with st.expander("📖 용어 / 사용법"):
