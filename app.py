@@ -38,8 +38,14 @@ def kst(ts) -> str:
     return (pd.Timestamp(ts) + pd.Timedelta(hours=9)).strftime("%H:%M")
 
 
+APP_VERSION = "2026-09-30 v4"
 st.title("📈 코인 추천")
-st.caption("Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님)")
+_engine_ver = getattr(cmr, "APP_VERSION", None)
+st.caption(f"Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님) · 버전 {APP_VERSION}")
+if _engine_ver != APP_VERSION:
+    st.error(f"⚠️ 파일 버전이 맞지 않아요. 화면(app.py)은 {APP_VERSION}인데 분석 엔진(crypto_market_regime.py)은 "
+             f"{_engine_ver or '이전 버전'}이에요. crypto_market_regime.py를 새 파일로 교체하고 앱을 재시작해주세요.")
+    st.stop()
 
 # ---------------------------------------------------------------- 설정
 with st.expander("⚙️ 설정"):

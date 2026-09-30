@@ -40,6 +40,7 @@ except ImportError:
 # 0. 설정
 # --------------------------------------------------------------------------
 
+APP_VERSION = "2026-09-30 v4"                     # 화면·검증 결과에 표시 — 새 파일이 반영됐는지 확인용
 EXCHANGES = ["bitget", "okx", "binance"]          # 앞쪽일수록 우선 사용(Bitget = 실제 거래 거래소). 일부 거래소는 서버 지역에 따라 차단될 수 있음
 QUOTE = "USDT"
 TOP_N_BY_VOLUME = 100                             # 거래량 상위 N개 코인만 스크리닝
@@ -1888,7 +1889,7 @@ def compare_modes_line(bt: Dict) -> str:
 def backtest_report_text(bt: Dict, risk_pct: float = 1.0) -> str:
     """결과를 복사해서 보내기 좋은 텍스트로."""
     actual = bt.get("days_actual", bt["days"])
-    lines = [f"[과거 검증] {bt['exchange']} · {tf_label(bt['timeframe'])} · 요청 {bt['days']}일 / 실제 {actual}일 · "
+    lines = [f"[과거 검증 {APP_VERSION}] {bt['exchange']} · {tf_label(bt['timeframe'])} · 요청 {bt['days']}일 / 실제 {actual}일 · "
              f"코인 {len(bt['coins'])}개",
              f"기간 {pd.Timestamp(bt['start']):%Y-%m-%d} ~ {pd.Timestamp(bt['end']):%Y-%m-%d}"]
     if bt.get("diag"):
