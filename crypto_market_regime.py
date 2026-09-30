@@ -717,7 +717,8 @@ def get_top_volume_symbols(exchange_id: str, top_n: int = TOP_N_BY_VOLUME) -> Li
     tickers = ex.fetch_tickers()
     usdt_pairs = [
         s for s in markets
-        if s.endswith(f"/{QUOTE}") and markets[s].get("active", True) and markets[s].get("spot", True)
+        if s.endswith(f"/{QUOTE}") and markets[s].get("active") is not False
+        and markets[s].get("spot") is not False
     ]
     def qv(sym: str) -> float:
         return tickers.get(sym, {}).get("quoteVolume") or 0
@@ -1304,7 +1305,7 @@ def bitget_perp_symbols() -> set:
         ex = _get_ex("bitget")
         ex.load_markets()
         return {m["symbol"] for m in ex.markets.values()
-                if m.get("swap") and m.get("linear") and m.get("active", True) and m.get("quote") == QUOTE}
+                if m.get("swap") and m.get("linear") and m.get("active") is not False and m.get("quote") == QUOTE}
     except Exception as e:
         print(f"[warn] Bitget 선물 목록 조회 실패: {e}")
         return set()
@@ -1524,7 +1525,8 @@ def fetch_extended_ohlcv(exchange_id: str, symbol: str, timeframe: Optional[str]
         raise RuntimeError("ccxt가 설치되어 있지 않습니다.")
     timeframe = timeframe or TIMEFRAME
     ex = _get_ex(exchange_id)
-    rows = _fetch_ohlcv_paged(ex, symbol, timeframe, total_bars, max_calls=40)
+    # 거래소마다 한 번에 주는 개수가 100~1000개라, 가장 적게 주는 경우(100개)도 최신까지 닿도록 호출 상한을 잡음
+    rows = _fetch_ohlcv_paged(ex, symbol, timeframe, total_bars, max_calls=min(400, total_bars // 100 + 10))
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df = df.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
@@ -1624,8 +1626,12 @@ def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = 
     def _R(exit_price: float, hold: int, weight: float) -> float:
         return weight * compute_trade_R(t["direction"], t["entry"], t["sl"], exit_price, hold)
 
-    def _done(total_r: float, i: int, reason: str) -> None:
-        trades.append({"R": float(total_r), "entry_idx": t["entry_idx"], "exit_idx": i,
+    def _G(exit_price: float, weight: float) -> float:  # 비용(수수료·슬리피지·펀딩) 빼기 전
+        return weight * compute_trade_R(t["direction"], t["entry"], t["sl"], exit_price, 0,
+                                        fee_pct=0.0, slippage_pct=0.0, funding_pct_per_8h=0.0)
+
+    def _done(total_r: float, i: int, reason: str, gross: float) -> None:
+        trades.append({"R": float(total_r), "gross_R": float(gross), "entry_idx": t["entry_idx"], "exit_idx": i,
                        "direction": t["direction"], "bias": t["bias"], "reason": reason})
 
     for i in range(len(df)):
@@ -1636,31 +1642,35 @@ def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = 
                 hit_sl = lows[i] <= t["sl"] if long_side else highs[i] >= t["sl"]
                 hit_tp = highs[i] >= t["tp1"] if long_side else lows[i] <= t["tp1"]
                 if hit_sl:
-                    _done(_R(t["sl"], hold, 1.0), i, "손절"); t = None
+                    _done(_R(t["sl"], hold, 1.0), i, "손절", _G(t["sl"], 1.0)); t = None
                 elif hit_tp and exit_mode == "fixed":
-                    _done(_R(t["tp1"], hold, 1.0), i, "목표1"); t = None
+                    _done(_R(t["tp1"], hold, 1.0), i, "목표1", _G(t["tp1"], 1.0)); t = None
                 elif hit_tp:
                     t["realized"] = _R(t["tp1"], hold, PARTIAL_TP_FRACTION)
+                    t["realized_g"] = _G(t["tp1"], PARTIAL_TP_FRACTION)
                     t["stage"], t["stop"] = 1, t["entry"]
                     t["best"] = highs[i] if long_side else lows[i]
                 elif hold >= max_hold_bars:
-                    _done(_R(closes[i], hold, 1.0), i, "기간만료"); t = None
+                    _done(_R(closes[i], hold, 1.0), i, "기간만료", _G(closes[i], 1.0)); t = None
             else:
                 rest = 1.0 - PARTIAL_TP_FRACTION
                 if long_side:
                     t["stop"] = max(t["stop"], t["best"] - TRAIL_ATR * t["atr"])
                     if lows[i] <= t["stop"]:
-                        _done(t["realized"] + _R(t["stop"], hold, rest), i, "추적손절"); t = None
+                        _done(t["realized"] + _R(t["stop"], hold, rest), i, "추적손절",
+                              t["realized_g"] + _G(t["stop"], rest)); t = None
                     else:
                         t["best"] = max(t["best"], highs[i])
                 else:
                     t["stop"] = min(t["stop"], t["best"] + TRAIL_ATR * t["atr"])
                     if highs[i] >= t["stop"]:
-                        _done(t["realized"] + _R(t["stop"], hold, rest), i, "추적손절"); t = None
+                        _done(t["realized"] + _R(t["stop"], hold, rest), i, "추적손절",
+                              t["realized_g"] + _G(t["stop"], rest)); t = None
                     else:
                         t["best"] = min(t["best"], lows[i])
                 if t and hold >= max_hold_bars:
-                    _done(t["realized"] + _R(closes[i], hold, rest), i, "기간만료"); t = None
+                    _done(t["realized"] + _R(closes[i], hold, rest), i, "기간만료",
+                          t["realized_g"] + _G(closes[i], rest)); t = None
             continue
         if pending:
             long_side = pending["direction"] == "long"
@@ -1704,7 +1714,9 @@ def summarize_trades(trades: List[Dict]) -> Dict:
     cum = np.cumsum(R_)
     max_dd = float(np.max(np.maximum.accumulate(np.concatenate([[0.0], cum]))[1:] - cum)) if len(cum) else 0.0
     half = len(R_) // 2
-    return {"n": int(len(R_)), "win_rate": float(len(wins) / len(R_)), "avg_R": float(R_.mean()),
+    G_ = np.array([x.get("gross_R", np.nan) for x in tr], dtype=float)
+    return {"avg_gross_R": float(np.nanmean(G_)) if np.isfinite(G_).any() else None,
+            "n": int(len(R_)), "win_rate": float(len(wins) / len(R_)), "avg_R": float(R_.mean()),
             "total_R": float(R_.sum()),
             "pf": float(wins.sum() / abs(losses.sum())) if losses.sum() != 0 else float("inf"),
             "avg_win": float(wins.mean()) if len(wins) else 0.0,
@@ -1723,8 +1735,12 @@ def interpret_backtest(summ: Dict, risk_pct: float = 1.0) -> List[str]:
     if n < 100:
         out.append(f"⚠️ 거래 {n}건 — 표본이 적어서 우연과 구분하기 어려워요. 코인 수나 기간을 늘려 100건 이상 확보하세요.")
     avg, fh, sh = summ["avg_R"], summ.get("first_half_avg"), summ.get("second_half_avg")
+    gross = summ.get("avg_gross_R")
     if avg <= 0:
         out.append(f"❌ 비용을 뺀 거래당 평균 {avg:+.2f}R — 이 기간·코인에서는 엣지가 확인되지 않았어요. 실전 투입은 권하지 않습니다.")
+        if gross is not None and gross > 0:
+            out.append(f"💸 비용을 빼기 전에는 {gross:+.2f}R이었어요. 수수료·슬리피지·펀딩비가 거래당 약 "
+                       f"{gross - avg:.2f}R를 가져가서 적자가 됐어요. 봉이 짧을수록 손절폭이 좁아 비용 비중이 커져요.")
     elif avg < 0.1:
         out.append(f"🟡 거래당 평균 {avg:+.2f}R — 약한 플러스라 수수료·슬리피지가 조금만 커져도 사라질 수 있는 수준이에요.")
     else:
@@ -1741,37 +1757,63 @@ def interpret_backtest(summ: Dict, risk_pct: float = 1.0) -> List[str]:
 
 def run_backtest_suite(n_coins: int = 15, days: int = 365, progress_cb=None) -> Dict:
     """거래량 상위 코인들의 실제 과거 데이터로 현재 전략을 검증 (두 청산 방식 비교 포함).
-    데이터 거래소는 EXCHANGES 순서(기본 Bitget → OKX → Binance)로 먼저 되는 곳을 씁니다."""
+    - 데이터 거래소: EXCHANGES 중 요청 기간을 가장 길게 주는 곳 (거래소마다 과거 제공 한도가 다름)
+    - 후보 코인: 라이브 추천과 같은 방식(여러 거래소 거래량 상위 합산 → 스테이블 제외 → Bitget 선물 가능)
+    - 후보가 줄어드는 단계별 개수를 diag에 기록해서, 결과가 비면 어디서 걸렸는지 바로 알 수 있게 함"""
     bar_hours = pd.Timedelta(TIMEFRAME) / pd.Timedelta("1h")
     warmup = 250
     total_bars = int(days * 24 / bar_hours) + warmup
+    diag: Dict = {"요청 봉 수": total_bars}
+
     ex_id, btc = None, None
     for cand in EXCHANGES:
         try:
-            b = fetch_extended_ohlcv(cand, f"BTC/{QUOTE}", TIMEFRAME, total_bars)
-            if len(b) >= warmup + 100:
-                ex_id, btc = cand, b
-                break
+            b_ = fetch_extended_ohlcv(cand, f"BTC/{QUOTE}", TIMEFRAME, total_bars)
         except Exception as e:
-            print(f"[warn] {cand} 과거 데이터 조회 실패: {e}")
+            diag[f"{cand} BTC"] = f"실패({str(e)[:60]})"
+            continue
+        diag[f"{cand} BTC"] = f"{len(b_)}봉"
+        if len(b_) >= warmup + 100 and (btc is None or len(b_) > len(btc)):
+            ex_id, btc = cand, b_
+        if btc is not None and len(btc) >= 0.9 * total_bars:
+            break
     if ex_id is None:
-        raise RuntimeError("과거 데이터를 받을 수 있는 거래소가 없어요 (네트워크·지역 차단 확인)")
+        raise RuntimeError(f"과거 데이터를 받을 수 있는 거래소가 없어요 (네트워크·지역 차단 확인) — 진단: {diag}")
 
+    universe = build_universe()
+    diag["후보(거래량 상위 합산)"] = len(universe)
+    pool = [x for x in universe if not _is_excluded_symbol(x) and x != f"BTC/{QUOTE}"]
+    diag["스테이블·BTC 제외 후"] = len(pool)
     perps = bitget_perp_symbols() if BITGET_ONLY else set()
-    cands = [x for x in get_top_volume_symbols(ex_id, n_coins * 3)
-             if not _is_excluded_symbol(x) and x != f"BTC/{QUOTE}"
-             and (not perps or f"{x}:{QUOTE}" in perps)][:n_coins]
+    diag["Bitget 선물 목록"] = len(perps) if BITGET_ONLY else "필터 꺼짐"
+    if perps:
+        pool = [x for x in pool if f"{x}:{QUOTE}" in perps]
+        diag["선물 가능 후"] = len(pool)
+    cands = pool[:n_coins]
+    if not cands:
+        raise RuntimeError(f"검증할 코인 후보가 없어요 — 진단: {diag}")
+
     trades = {"partial_trail": [], "fixed": []}
     coins, errors = [], []
     for k, sym in enumerate(cands):
         if progress_cb:
             progress_cb(k, len(cands), sym)
         try:
-            d = fetch_extended_ohlcv(ex_id, sym, TIMEFRAME, total_bars)
-            htf = fetch_extended_ohlcv(ex_id, sym, HTF_TIMEFRAME, _htf_bars_needed(total_bars) + 250)
+            d, htf, src = None, None, None
+            for src in dict.fromkeys([ex_id, universe.get(sym, ex_id)]):  # 데이터 거래소 → 안 되면 원래 목록 거래소
+                try:
+                    d = fetch_extended_ohlcv(src, sym, TIMEFRAME, total_bars)
+                except Exception:
+                    d = None
+                if d is not None and len(d) >= warmup + 100:
+                    htf = fetch_extended_ohlcv(src, sym, HTF_TIMEFRAME, _htf_bars_needed(total_bars) + 250)
+                    break
+            if d is None or htf is None:
+                errors.append(f"{sym}: 과거 데이터 부족")
+                continue
             m = d.merge(btc[["ts", "close"]].rename(columns={"close": "btc_close"}), on="ts", how="inner")
             if len(m) < warmup + 100:
-                errors.append(f"{sym}: 데이터 부족({len(m)}봉)")
+                errors.append(f"{sym}: BTC와 겹치는 기간 부족({len(m)}봉)")
                 continue
             coin_df = m[["ts", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
             btc_al = pd.DataFrame({"ts": m["ts"], "close": m["btc_close"]}).reset_index(drop=True)
@@ -1783,12 +1825,16 @@ def run_backtest_suite(n_coins: int = 15, days: int = 365, progress_cb=None) -> 
                     trades[mode].append(x)
             coins.append(sym)
         except Exception as e:
-            errors.append(f"{sym}: {e}")
+            errors.append(f"{sym}: {str(e)[:80]}")
     if progress_cb:
         progress_cb(len(cands), len(cands), "")
-    return {"exchange": ex_id, "timeframe": TIMEFRAME, "days": days, "coins": coins, "errors": errors,
-            "trades": trades, "start": btc["ts"].iloc[warmup] if len(btc) > warmup else None,
-            "end": btc["ts"].iloc[-1], "ran_at": utc_now()}
+    start = btc["ts"].iloc[warmup]
+    end = btc["ts"].iloc[-1]
+    if utc_now() - end > pd.Timedelta(TIMEFRAME) * 3:
+        diag["⚠️ 최근 데이터 누락"] = f"마지막 봉 {end:%Y-%m-%d %H:%M}"
+    return {"exchange": ex_id, "timeframe": TIMEFRAME, "days": days,
+            "days_actual": int((end - start) / pd.Timedelta("1D")), "coins": coins, "errors": errors,
+            "trades": trades, "start": start, "end": end, "ran_at": utc_now(), "diag": diag}
 
 
 EXIT_MODE_LABEL = {"partial_trail": "분할익절+추적손절", "fixed": "목표1 전량"}
@@ -1801,8 +1847,10 @@ def backtest_mode_table(bt: Dict) -> pd.DataFrame:
         sm = summarize_trades(bt["trades"][mode])
         if sm["n"] == 0:
             rows.append({"청산 방식": name, "거래 수": 0}); continue
+        g = sm.get("avg_gross_R")
         rows.append({"청산 방식": name, "거래 수": sm["n"], "승률": f"{sm['win_rate']:.0%}",
-                     "평균 R": f"{sm['avg_R']:+.2f}", "PF": f"{sm['pf']:.2f}", "합계 R": f"{sm['total_R']:+.1f}",
+                     "평균 R": f"{sm['avg_R']:+.2f}", "비용 전 R": f"{g:+.2f}" if g is not None else "-",
+                     "PF": f"{sm['pf']:.2f}", "합계 R": f"{sm['total_R']:+.1f}",
                      "최대 연속 손실": sm["max_consec_loss"], "최대 낙폭(R)": f"{sm['max_dd_R']:.1f}",
                      "전반/후반 R": f"{sm['first_half_avg']:+.2f} / {sm['second_half_avg']:+.2f}"})
     return pd.DataFrame(rows)
@@ -1839,13 +1887,18 @@ def compare_modes_line(bt: Dict) -> str:
 
 def backtest_report_text(bt: Dict, risk_pct: float = 1.0) -> str:
     """결과를 복사해서 보내기 좋은 텍스트로."""
-    lines = [f"[과거 검증] {bt['exchange']} · {tf_label(bt['timeframe'])} · {bt['days']}일 · 코인 {len(bt['coins'])}개",
+    actual = bt.get("days_actual", bt["days"])
+    lines = [f"[과거 검증] {bt['exchange']} · {tf_label(bt['timeframe'])} · 요청 {bt['days']}일 / 실제 {actual}일 · "
+             f"코인 {len(bt['coins'])}개",
              f"기간 {pd.Timestamp(bt['start']):%Y-%m-%d} ~ {pd.Timestamp(bt['end']):%Y-%m-%d}"]
+    if bt.get("diag"):
+        lines.append("- 진단: " + ", ".join(f"{k} {v}" for k, v in bt["diag"].items()))
     for mode, name in (("partial_trail", "분할익절+추적손절"), ("fixed", "목표1 전량")):
         sm = summarize_trades(bt["trades"][mode])
         if sm["n"] == 0:
             lines.append(f"- {name}: 거래 없음"); continue
-        lines.append(f"- {name}: {sm['n']}건, 승률 {sm['win_rate']:.0%}, 평균 {sm['avg_R']:+.2f}R, PF {sm['pf']:.2f}, "
+        g_txt = f" (비용 전 {sm['avg_gross_R']:+.2f}R)" if sm.get("avg_gross_R") is not None else ""
+        lines.append(f"- {name}: {sm['n']}건, 승률 {sm['win_rate']:.0%}, 평균 {sm['avg_R']:+.2f}R{g_txt}, PF {sm['pf']:.2f}, "
                      f"합계 {sm['total_R']:+.1f}R, 최대연속손실 {sm['max_consec_loss']}, 최대낙폭 {sm['max_dd_R']:.1f}R, "
                      f"전반/후반 {sm['first_half_avg']:+.2f}/{sm['second_half_avg']:+.2f}R")
     tr = bt["trades"]["partial_trail"]
@@ -1854,10 +1907,14 @@ def backtest_report_text(bt: Dict, risk_pct: float = 1.0) -> str:
         for x in tr:
             g = x["direction"] if key == "direction" else SETUP_FAMILY.get(x["bias"], x["bias"])
             groups.setdefault(g, []).append(x)
-        parts = [f"{g} {summarize_trades(v)['n']}건 {summarize_trades(v)['avg_R']:+.2f}R" for g, v in groups.items()]
+        parts = []
+        for g, v in groups.items():
+            sm_ = summarize_trades(v)
+            gtxt = f"(비용 전 {sm_['avg_gross_R']:+.2f})" if sm_.get("avg_gross_R") is not None else ""
+            parts.append(f"{g} {sm_['n']}건 {sm_['avg_R']:+.2f}R{gtxt}")
         lines.append(f"- {label}별(분할익절): " + (", ".join(parts) or "없음"))
     if bt["errors"]:
-        lines.append(f"- 제외된 코인: {len(bt['errors'])}개")
+        lines.append(f"- 제외된 코인 {len(bt['errors'])}개: " + " / ".join(bt["errors"][:8]))
     return "\n".join(lines)
 
 

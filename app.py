@@ -1,5 +1,5 @@
 """
-app.py — 심신안정 웹 화면 (핸드폰 우선)
+app.py — 코인 추천 웹 화면 (핸드폰 우선)
 실행:  streamlit run app.py
 배포:  README.md 참고 (Streamlit Community Cloud 또는 본인 PC/서버)
 
@@ -19,7 +19,7 @@ import streamlit as st
 import app_logic as L
 import crypto_market_regime as cmr
 
-st.set_page_config(page_title="심신안정", page_icon="📈", layout="centered",
+st.set_page_config(page_title="코인 추천", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
 st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 
@@ -38,7 +38,7 @@ def kst(ts) -> str:
     return (pd.Timestamp(ts) + pd.Timedelta(hours=9)).strftime("%H:%M")
 
 
-st.title("📈 심신안정")
+st.title("📈 코인 추천")
 st.caption("Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님)")
 
 # ---------------------------------------------------------------- 설정
@@ -109,6 +109,10 @@ def render_backtest() -> None:
     st.caption(f"{bt['exchange']} · {cmr.tf_label(bt['timeframe'])} · "
                f"{pd.Timestamp(bt['start']):%Y-%m-%d} ~ {pd.Timestamp(bt['end']):%Y-%m-%d} · "
                f"코인 {len(bt['coins'])}개 · 실행 {kst(bt['ran_at'])}")
+    actual = bt.get("days_actual", bt["days"])
+    if actual < 0.9 * bt["days"]:
+        st.warning(f"요청한 {bt['days']}일 중 실제로는 {actual}일치만 받을 수 있었어요 "
+                   f"(거래소가 제공하는 과거 데이터 한도). 결과는 이 기간 기준이에요.")
     st.dataframe(cmr.backtest_mode_table(bt), hide_index=True, use_container_width=True)
     lines = cmr.interpret_backtest(cmr.summarize_trades(bt["trades"]["partial_trail"]), risk_pct)
     cmp_line = cmr.compare_modes_line(bt)
