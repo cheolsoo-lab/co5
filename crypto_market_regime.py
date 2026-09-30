@@ -40,10 +40,11 @@ except ImportError:
 # 0. 설정
 # --------------------------------------------------------------------------
 
-APP_VERSION = "2026-09-30 v4"                     # 화면·검증 결과에 표시 — 새 파일이 반영됐는지 확인용
+APP_VERSION = "2026-09-30 v5"                     # 화면·검증 결과에 표시 — 새 파일이 반영됐는지 확인용
 EXCHANGES = ["bitget", "okx", "binance"]          # 앞쪽일수록 우선 사용(Bitget = 실제 거래 거래소). 일부 거래소는 서버 지역에 따라 차단될 수 있음
 QUOTE = "USDT"
-TOP_N_BY_VOLUME = 100                             # 거래량 상위 N개 코인만 스크리닝
+TOP_N_BY_VOLUME = 30                              # 스캔 코인 수 = 3개 거래소 합산 거래량 순위 상위 N개 (검증된 범위에 맞춤)
+ENABLED_FAMILIES = {"돌파"}                        # 추천할 신호 유형 (2년 검증에서 돌파만 뚜렷한 플러스)
 TIMEFRAME = "4h"                                  # 스윙 트레이딩 기준 봉
 OHLCV_LIMIT = 600                                 # 4h 캔들 개수 (EMA200이 제대로 계산되려면 수백 개 필요 — 200개면 첫 봉 비중이 13%나 남음)
 HTF_LIMIT = 300                                   # 일봉 캔들 개수 (일봉 EMA200용)
@@ -710,17 +711,19 @@ class CoinSetup:
     coin_regime: str = ""  # 이 코인 자체의 국면 (시장 전체와 비교해 역행 여부 판단)
     atr: float = 0.0       # 신호 계산 시점의 ATR (추격 판단·추적 손절 폭 계산용)
     live_status: str = ""  # ready(진입가 근처) / chase(추격 구간) / invalid(손절선 먼저 이탈) / missed(목표 먼저 도달)
+    perp_symbol: str = ""  # Bitget 선물 심볼 (예: 1000PEPE/USDT:USDT)
+    perp_mult: int = 1     # 선물 가격 = 현물 가격 × perp_mult
 
 
-def get_top_volume_symbols(exchange_id: str, top_n: int = TOP_N_BY_VOLUME) -> List[str]:
+def _volume_list(exchange_id: str, top_n: int) -> List[tuple]:
+    """(심볼, 24h 거래대금) 목록, 거래대금 순. 거래 가능 여부가 비어 있으면(None) 가능으로 처리."""
     ex = _get_ex(exchange_id)
     markets = ex.load_markets()
     tickers = ex.fetch_tickers()
-    usdt_pairs = [
-        s for s in markets
-        if s.endswith(f"/{QUOTE}") and markets[s].get("active") is not False
-        and markets[s].get("spot") is not False
-    ]
+    usdt_pairs = [s_ for s_ in markets
+                  if s_.endswith(f"/{QUOTE}") and markets[s_].get("active") is not False
+                  and markets[s_].get("spot") is not False]
+
     def qv(sym: str) -> float:
         return tickers.get(sym, {}).get("quoteVolume") or 0
 
@@ -728,7 +731,11 @@ def get_top_volume_symbols(exchange_id: str, top_n: int = TOP_N_BY_VOLUME) -> Li
     # 거래대금 정보를 주지 않는 거래소면 필터를 건너뜀 (전부 0으로 보여 통째로 빠지는 것 방지)
     if sum(1 for sym in ranked if qv(sym) > 0) >= 10:
         ranked = [sym for sym in ranked if qv(sym) >= MIN_QUOTE_VOLUME_USDT]
-    return ranked[:top_n]
+    return [(sym, float(qv(sym))) for sym in ranked[:top_n]]
+
+
+def get_top_volume_symbols(exchange_id: str, top_n: Optional[int] = None) -> List[str]:
+    return [sym for sym, _ in _volume_list(exchange_id, top_n or TOP_N_BY_VOLUME)]
 
 
 def relative_strength_vs_btc(coin_df: pd.DataFrame, btc_df: pd.DataFrame,
@@ -850,7 +857,7 @@ def get_funding_rate(exchange_id: str, symbol: str) -> Optional[float]:
     try:
         ex = _get_ex(exchange_id)
         ex.load_markets()
-        swap_symbol = f"{symbol}:{QUOTE}"
+        swap_symbol = symbol if ":" in symbol else f"{symbol}:{QUOTE}"
         if swap_symbol not in ex.markets:
             return None
         fr = ex.fetch_funding_rate(swap_symbol)
@@ -1099,7 +1106,7 @@ REJECT_LABELS = {
     "invalid_price": "이미 손절선을 넘음(무효)", "target_reached": "이미 목표가 도달(놓침)",
     "no_box": "유효한 박스 아님", "lean_against": "횡보 기울기와 반대", "mid_box": "박스 중간(관망)",
     "htf_against": "일봉 추세와 반대", "wide_spread": "스프레드 넓음", "funding_hot": "펀딩비 과열",
-    "low_rr": "손익비 부족",
+    "low_rr": "손익비 부족", "family_off": "꺼둔 신호 유형",
 }
 
 
@@ -1312,20 +1319,62 @@ def bitget_perp_symbols() -> set:
         return set()
 
 
-def build_universe() -> Dict[str, str]:
-    """거래소별 거래량 상위 코인을 합쳐 중복 제거. 같은 코인은 EXCHANGES 순서상 먼저 나온
-    거래소(기본 Bitget)의 캔들을 사용 → 실제 거래하는 곳의 가격 기준으로 분석하고 API 호출도 절약."""
-    universe: Dict[str, str] = {}
+_PERP_MULTS = (1, 1000, 10000, 1000000)
+UNIVERSE_DIAG: Dict = {}
+
+
+def perp_match(symbol: str, perps: set):
+    """현물 심볼에 맞는 Bitget 선물 심볼과 가격 배수. 예) PEPE/USDT → 1000PEPE/USDT:USDT, 1000배.
+    (선물은 가격이 너무 작은 코인을 1000배 단위로 표기해서, 그대로 찾으면 '선물 없음'으로 빠졌음)"""
+    base = symbol.split("/")[0]
+    for m in _PERP_MULTS:
+        cand = f"{'' if m == 1 else m}{base}/{QUOTE}:{QUOTE}"
+        if cand in perps:
+            return cand, m
+    return None, 1
+
+
+def build_universe(top_n: Optional[int] = None, perps: Optional[set] = None) -> Dict[str, Dict]:
+    """3개 거래소 거래량 목록을 합쳐 '합산 거래량 순위' 상위 top_n개를 반환 {심볼: {src, vol, perp, mult}}.
+    - 캔들은 EXCHANGES 순서상 먼저 나온 거래소(기본 Bitget)에서 받음
+    - 순위는 거래소들 중 가장 큰 24h 거래대금 기준
+    - perps를 주면 Bitget 선물로 거래 가능한 코인만 남긴 뒤 순위를 자름 → N은 '실제 거래 가능한 N개'"""
+    top_n = top_n or TOP_N_BY_VOLUME
+    merged: Dict[str, Dict] = {}
     for exchange_id in EXCHANGES:
         try:
-            symbols = get_top_volume_symbols(exchange_id, TOP_N_BY_VOLUME)
+            lst = _volume_list(exchange_id, max(top_n, 30) * 2)
         except Exception as e:
-            print(f"[warn] {exchange_id} 심볼 조회 실패: {e}")
+            print(f"[warn] {exchange_id} 거래량 목록 조회 실패: {e}")
             continue
-        for sym in symbols:
-            if not _is_excluded_symbol(sym):
-                universe.setdefault(sym, exchange_id)
-    return universe
+        for sym, vol in lst:
+            if _is_excluded_symbol(sym):
+                continue
+            if sym not in merged:
+                merged[sym] = {"src": exchange_id, "vol": vol}
+            else:
+                merged[sym]["vol"] = max(merged[sym]["vol"], vol)
+    ranked = sorted(merged.items(), key=lambda kv: -kv[1]["vol"])
+    UNIVERSE_DIAG.clear()
+    UNIVERSE_DIAG["합산 후보"] = len(ranked)
+    if perps:
+        kept, dropped, mult_n = [], 0, 0
+        for sym, info in ranked:
+            p, m = perp_match(sym, perps)
+            if p is None:
+                dropped += 1
+                continue
+            info.update(perp=p, mult=m)
+            mult_n += m > 1
+            kept.append((sym, info))
+        ranked = kept
+        UNIVERSE_DIAG.update({"Bitget 선물 없음": dropped, "배수 표기로 매칭(1000PEPE 등)": mult_n})
+    else:
+        for sym, info in ranked:
+            info.update(perp=f"{sym}:{QUOTE}", mult=1)
+    out = dict(ranked[:top_n])
+    UNIVERSE_DIAG["스캔 대상"] = len(out)
+    return out
 
 
 LAST_SCAN_STATS: Dict = {}
@@ -1413,22 +1462,19 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
     _REJECTS.clear()
     if btc_df is None:
         btc_df, _ = split_live(fetch_btc_df())
-    universe = build_universe()
     perps = bitget_perp_symbols() if BITGET_ONLY else set()
     if BITGET_ONLY and not perps:
         print("[warn] Bitget 선물 목록을 못 가져와 '선물 거래 가능 여부' 필터를 건너뜁니다.")
+    universe = build_universe(TOP_N_BY_VOLUME, perps or None)
     fund_ex = "bitget" if perps else None
     setups: List[CoinSetup] = []
     breadth = {"uptrend": 0, "downtrend": 0, "sideways": 0, "n": 0}
     items = list(universe.items())
 
-    for idx, (symbol, exchange_id) in enumerate(items):
+    for idx, (symbol, info) in enumerate(items):
+        exchange_id = info["src"]
         if progress_cb:
             progress_cb(idx, len(items), symbol)
-        swap_symbol = f"{symbol}:{QUOTE}"
-        if BITGET_ONLY and perps and swap_symbol not in perps:
-            _rej("not_perp")
-            continue
         try:
             full = fetch_ohlcv(exchange_id, symbol)
             if full is None or len(full) < 61:
@@ -1443,6 +1489,9 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
             setup = build_setup(symbol, exchange_id, df, btc_df, coin_regime, htf_trend or "sideways",
                                 current_price=live)
             if not setup:
+                continue
+            if SETUP_FAMILY.get(setup.bias) not in ENABLED_FAMILIES:
+                _rej("family_off")
                 continue
             setup.coin_regime = coin_regime
             setup.counter_trend = coin_regime in ("uptrend", "downtrend") and coin_regime != market_regime
@@ -1462,12 +1511,13 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
                 print(f"[skip] {symbol}: 스프레드 {spread:.2f}% — 슬리피지 위험으로 제외")
                 continue
 
-            if not funding_rate_ok(fund_ex or exchange_id, symbol, setup.bias):
+            if not funding_rate_ok(fund_ex or exchange_id, info.get("perp") or symbol, setup.bias):
                 _rej("funding_hot")
                 print(f"[skip] {symbol}: 펀딩비 과열 방향이라 제외 ({setup.bias})")
                 continue
 
-            setup.bitget_perp = (swap_symbol in perps) if perps else None
+            setup.bitget_perp = True if perps else None
+            setup.perp_symbol, setup.perp_mult = info.get("perp", ""), int(info.get("mult", 1))
             setups.append(setup)
         except Exception as e:  # 코인 하나의 실패가 전체 스캔을 멈추지 않도록
             _rej("error")
@@ -1486,7 +1536,7 @@ def screen_market(market_regime: RegimeType, progress_cb=None,
     passed.sort(key=lambda x: x.rr_ratio, reverse=True)
 
     LAST_SCAN_STATS.clear()
-    LAST_SCAN_STATS.update({"rejects": dict(_REJECTS), "breadth": dict(breadth),
+    LAST_SCAN_STATS.update({"universe_diag": dict(UNIVERSE_DIAG), "rejects": dict(_REJECTS), "breadth": dict(breadth),
                             "universe": len(items), "passed": len(passed)})
     summary = ", ".join(f"{REJECT_LABELS.get(k, k)} {v}" for k, v in sorted(_REJECTS.items(), key=lambda kv: -kv[1]))
     print(f"[필터 통과율] 대상 {len(items)}개 → 최종 {len(passed)}개 | 제외: {summary or '없음'}")
@@ -1607,7 +1657,8 @@ def generate_signals(df: pd.DataFrame, btc_df: pd.DataFrame, htf_df: Optional[pd
             continue
         signals[i] = {"direction": "long" if x.bias in LONG_BIASES else "short", "bias": x.bias,
                       "entry": x.entry_price, "sl": x.sl, "tp1": x.tp1, "atr": x.atr,
-                      "is_chase": x.is_chase, "rr": x.rr_ratio}
+                      "is_chase": x.is_chase, "rr": x.rr_ratio,
+                      "atr_pct": x.atr / x.entry_price * 100 if x.entry_price else None}
     return signals
 
 
@@ -1632,7 +1683,8 @@ def simulate_exits(df: pd.DataFrame, signals: Dict[int, Dict], exit_mode: str = 
                                         fee_pct=0.0, slippage_pct=0.0, funding_pct_per_8h=0.0)
 
     def _done(total_r: float, i: int, reason: str, gross: float) -> None:
-        trades.append({"R": float(total_r), "gross_R": float(gross), "entry_idx": t["entry_idx"], "exit_idx": i,
+        trades.append({"R": float(total_r), "gross_R": float(gross), "atr_pct": t.get("atr_pct"),
+                       "entry_idx": t["entry_idx"], "exit_idx": i,
                        "direction": t["direction"], "bias": t["bias"], "reason": reason})
 
     for i in range(len(df)):
@@ -1756,6 +1808,9 @@ def interpret_backtest(summ: Dict, risk_pct: float = 1.0) -> List[str]:
     return out
 
 
+TIER_BOUNDS = [("거래량 1~30위", 0, 30), ("거래량 31~60위", 30, 60), ("거래량 61~100위", 60, 100)]
+
+
 def run_backtest_suite(n_coins: int = 15, days: int = 365, progress_cb=None) -> Dict:
     """거래량 상위 코인들의 실제 과거 데이터로 현재 전략을 검증 (두 청산 방식 비교 포함).
     - 데이터 거래소: EXCHANGES 중 요청 기간을 가장 길게 주는 곳 (거래소마다 과거 제공 한도가 다름)
@@ -1781,27 +1836,32 @@ def run_backtest_suite(n_coins: int = 15, days: int = 365, progress_cb=None) -> 
     if ex_id is None:
         raise RuntimeError(f"과거 데이터를 받을 수 있는 거래소가 없어요 (네트워크·지역 차단 확인) — 진단: {diag}")
 
-    universe = build_universe()
-    diag["후보(거래량 상위 합산)"] = len(universe)
-    pool = [x for x in universe if not _is_excluded_symbol(x) and x != f"BTC/{QUOTE}"]
-    diag["스테이블·BTC 제외 후"] = len(pool)
     perps = bitget_perp_symbols() if BITGET_ONLY else set()
     diag["Bitget 선물 목록"] = len(perps) if BITGET_ONLY else "필터 꺼짐"
-    if perps:
-        pool = [x for x in pool if f"{x}:{QUOTE}" in perps]
-        diag["선물 가능 후"] = len(pool)
-    cands = pool[:n_coins]
+    universe = build_universe(TIER_BOUNDS[-1][2], perps or None)
+    diag.update(UNIVERSE_DIAG)
+    ranked = [x for x in universe if x != f"BTC/{QUOTE}"]
+    # 거래량 구간(1~30위 / 31~60위 / 61~100위)에서 고르게 뽑음 — 추천 스캔 범위를 구간 단위로 정하기 위해
+    per = [n_coins // 3 + (1 if i < n_coins % 3 else 0) for i in range(3)]
+    cands: List[tuple] = []
+    for (label, a_, b_), k_ in zip(TIER_BOUNDS, per):
+        seg = ranked[a_:b_]
+        if not seg or k_ <= 0:
+            continue
+        idx = np.linspace(0, len(seg) - 1, num=min(k_, len(seg))).round().astype(int)
+        cands += [(seg[j], label) for j in dict.fromkeys(idx.tolist())]
+    diag["표본"] = ", ".join(f"{lb} {sum(1 for _, t_ in cands if t_ == lb)}개" for lb, _, _ in TIER_BOUNDS)
     if not cands:
         raise RuntimeError(f"검증할 코인 후보가 없어요 — 진단: {diag}")
 
     trades = {"partial_trail": [], "fixed": []}
     coins, errors = [], []
-    for k, sym in enumerate(cands):
+    for k, (sym, tier) in enumerate(cands):
         if progress_cb:
             progress_cb(k, len(cands), sym)
         try:
             d, htf, src = None, None, None
-            for src in dict.fromkeys([ex_id, universe.get(sym, ex_id)]):  # 데이터 거래소 → 안 되면 원래 목록 거래소
+            for src in dict.fromkeys([ex_id, universe.get(sym, {}).get("src", ex_id)]):  # 데이터 거래소 → 안 되면 원래 목록 거래소
                 try:
                     d = fetch_extended_ohlcv(src, sym, TIMEFRAME, total_bars)
                 except Exception:
@@ -1821,7 +1881,7 @@ def run_backtest_suite(n_coins: int = 15, days: int = 365, progress_cb=None) -> 
             sig = generate_signals(coin_df, btc_al, htf, warmup=warmup)
             for mode in trades:
                 for x in simulate_exits(coin_df, sig, mode):
-                    x.update(symbol=sym, entry_ts=coin_df["ts"].iloc[x["entry_idx"]],
+                    x.update(symbol=sym, tier=tier, entry_ts=coin_df["ts"].iloc[x["entry_idx"]],
                              exit_ts=coin_df["ts"].iloc[x["exit_idx"]])
                     trades[mode].append(x)
             coins.append(sym)
@@ -1857,24 +1917,116 @@ def backtest_mode_table(bt: Dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _vol_edges(trades: List[Dict]):
+    v = np.array([x["atr_pct"] for x in trades if x.get("atr_pct") is not None], dtype=float)
+    return (float(np.quantile(v, 1 / 3)), float(np.quantile(v, 2 / 3))) if len(v) >= 6 else None
+
+
+def _group_key(x: Dict, by: str, edges=None) -> str:
+    if by == "direction":
+        return "롱" if x["direction"] == "long" else "숏"
+    if by == "family":
+        return SETUP_FAMILY.get(x["bias"], x["bias"])
+    if by == "tier":
+        return x.get("tier", "구간 정보 없음")
+    if by == "vol":
+        v = x.get("atr_pct")
+        if v is None or edges is None:
+            return "정보 없음"
+        q1, q2 = edges
+        return f"낮음(~{q1:.1f}%)" if v <= q1 else (f"중간({q1:.1f}~{q2:.1f}%)" if v <= q2 else f"높음({q2:.1f}%~)")
+    return x.get("symbol", "?")
+
+
 def backtest_group_table(trades: List[Dict], by: str) -> pd.DataFrame:
-    """by: 'direction'(롱/숏) · 'family'(추세/돌파/박스 역매매) · 'symbol'(코인별)."""
+    """by: direction(롱/숏) · family(추세/돌파/박스 역매매) · tier(거래량 구간) · vol(진입 시점 변동성) · symbol."""
+    edges = _vol_edges(trades) if by == "vol" else None
     groups: Dict[str, List[Dict]] = {}
     for x in trades:
-        if by == "direction":
-            g = "롱" if x["direction"] == "long" else "숏"
-        elif by == "family":
-            g = SETUP_FAMILY.get(x["bias"], x["bias"])
-        else:
-            g = x.get("symbol", "?")
-        groups.setdefault(g, []).append(x)
+        groups.setdefault(_group_key(x, by, edges), []).append(x)
     rows = []
     for g, v in groups.items():
         sm = summarize_trades(v)
         rows.append({"구분": g, "거래 수": sm["n"], "승률": f"{sm['win_rate']:.0%}", "평균 R": round(sm["avg_R"], 2),
+                     "비용 전 R": round(sm["avg_gross_R"], 2) if sm.get("avg_gross_R") is not None else None,
                      "합계 R": round(sm["total_R"], 1)})
     out = pd.DataFrame(rows)
-    return out.sort_values("합계 R", ascending=False).reset_index(drop=True) if len(out) else out
+    if not len(out):
+        return out
+    if by in ("tier", "vol"):  # 순서가 의미 있는 구분은 자연 순서로
+        order = [t[0] for t in TIER_BOUNDS] if by == "tier" else ["낮음", "중간", "높음"]
+        out["_o"] = out["구분"].map(lambda g: next((i for i, o in enumerate(order) if g.startswith(o)), 99))
+        return out.sort_values("_o").drop(columns="_o").reset_index(drop=True)
+    return out.sort_values("합계 R", ascending=False).reset_index(drop=True)
+
+
+def family_check(trades: List[Dict], family: str = "돌파") -> Dict:
+    """특정 신호 유형의 견고성 점검: 전반/후반, 롱/숏, 상위 5건 의존도."""
+    tr = [x for x in trades if SETUP_FAMILY.get(x["bias"]) == family]
+    sm = summarize_trades(tr)
+    if sm["n"] == 0:
+        return {"family": family, "n": 0}
+    r_sorted = sorted((x["R"] for x in tr), reverse=True)
+    total = sum(r_sorted)
+    longs = [x["R"] for x in tr if x["direction"] == "long"]
+    shorts = [x["R"] for x in tr if x["direction"] == "short"]
+    return {"family": family, "n": sm["n"], "avg": sm["avg_R"], "first": sm["first_half_avg"],
+            "second": sm["second_half_avg"], "long_n": len(longs), "long_avg": float(np.mean(longs)) if longs else None,
+            "short_n": len(shorts), "short_avg": float(np.mean(shorts)) if shorts else None,
+            "top5_share": float(sum(r_sorted[:5]) / total) if total > 0 else None,
+            "avg_ex_top5": float(np.mean(r_sorted[5:])) if len(r_sorted) > 5 else None}
+
+
+def family_check_lines(fc: Dict) -> List[str]:
+    if not fc.get("n"):
+        return [f"{fc['family']} 신호 거래가 없어요."]
+    out = [f"{fc['family']} 신호 {fc['n']}건, 거래당 평균 {fc['avg']:+.2f}R"]
+    if fc["n"] < 50:
+        out.append(f"⚠️ {fc['n']}건은 적어요. 결론은 표본이 더 쌓인 뒤에 내리는 게 안전해요.")
+    if fc["first"] is not None and fc["second"] is not None:
+        ok = fc["first"] > 0 and fc["second"] > 0
+        out.append(f"{'✅' if ok else '⚠️'} 전반부 {fc['first']:+.2f}R · 후반부 {fc['second']:+.2f}R"
+                   + ("" if ok else " — 한쪽 기간에서만 통했어요"))
+    if fc["avg_ex_top5"] is not None:
+        ok = fc["avg_ex_top5"] > 0
+        share = f", 상위 5건이 수익의 {fc['top5_share']:.0%}" if fc.get("top5_share") is not None else ""
+        out.append(f"{'✅' if ok else '⚠️'} 가장 큰 5건을 빼도 평균 {fc['avg_ex_top5']:+.2f}R{share}"
+                   + ("" if ok else " — 소수의 대박 거래에 기대고 있어요"))
+    parts = []
+    if fc["long_avg"] is not None:
+        parts.append(f"롱 {fc['long_n']}건 {fc['long_avg']:+.2f}R")
+    if fc["short_avg"] is not None:
+        parts.append(f"숏 {fc['short_n']}건 {fc['short_avg']:+.2f}R")
+    if parts:
+        out.append("방향별: " + ", ".join(parts))
+    return out
+
+
+def suggest_scan_count(trades: List[Dict], families: Optional[set] = None, min_n: int = 20) -> str:
+    """거래량 구간별 결과로 '어디까지 스캔해도 되는지' 제안 (켜둔 신호 유형 기준).
+    구간마다 거래가 min_n건 이상이고 평균이 플러스여야 통과. 표본 부족과 마이너스를 구분해서 알려줌."""
+    tr = [x for x in trades if families is None or SETUP_FAMILY.get(x["bias"]) in families]
+    ok_upto, detail, stop_reason = 0, [], ""
+    for label, _, b_ in TIER_BOUNDS:
+        sm = summarize_trades([x for x in tr if x.get("tier") == label])
+        if sm["n"] == 0:
+            detail.append(f"{label} 거래 없음")
+            stop_reason = f"{label}에서 거래가 없어 판단할 수 없어요"
+            break
+        detail.append(f"{label} {sm['n']}건 {sm['avg_R']:+.2f}R")
+        if sm["n"] < min_n:
+            stop_reason = f"{label} 거래가 {sm['n']}건뿐이라 판단하기엔 표본이 부족해요(검증 코인 수·기간을 늘려보세요)"
+            break
+        if sm["avg_R"] <= 0:
+            stop_reason = f"{label}에서 마이너스라 이 구간부터는 스캔하지 않는 게 좋아요"
+            break
+        ok_upto = b_
+    fam = "·".join(sorted(families)) if families else "전체"
+    head = f"🔎 [{fam}] " + " / ".join(detail) + " → "
+    if ok_upto == 0:
+        return head + stop_reason + ". 지금은 스캔 수를 늘릴 근거가 없어요."
+    tail = f" ({stop_reason})" if stop_reason else ""
+    return head + f"스캔 코인 수는 {ok_upto}개까지가 검증된 범위예요{tail}."
 
 
 def compare_modes_line(bt: Dict) -> str:
@@ -1903,17 +2055,14 @@ def backtest_report_text(bt: Dict, risk_pct: float = 1.0) -> str:
                      f"합계 {sm['total_R']:+.1f}R, 최대연속손실 {sm['max_consec_loss']}, 최대낙폭 {sm['max_dd_R']:.1f}R, "
                      f"전반/후반 {sm['first_half_avg']:+.2f}/{sm['second_half_avg']:+.2f}R")
     tr = bt["trades"]["partial_trail"]
-    for key, label in (("direction", "방향"), ("family", "유형")):
-        groups: Dict[str, List[Dict]] = {}
-        for x in tr:
-            g = x["direction"] if key == "direction" else SETUP_FAMILY.get(x["bias"], x["bias"])
-            groups.setdefault(g, []).append(x)
-        parts = []
-        for g, v in groups.items():
-            sm_ = summarize_trades(v)
-            gtxt = f"(비용 전 {sm_['avg_gross_R']:+.2f})" if sm_.get("avg_gross_R") is not None else ""
-            parts.append(f"{g} {sm_['n']}건 {sm_['avg_R']:+.2f}R{gtxt}")
+    for key, label in (("direction", "방향"), ("family", "유형"), ("tier", "거래량 구간"), ("vol", "진입 변동성")):
+        tb = backtest_group_table(tr, key)
+        parts = [f"{r['구분']} {r['거래 수']}건 {r['평균 R']:+.2f}R"
+                 + (f"(비용 전 {r['비용 전 R']:+.2f})" if r.get("비용 전 R") is not None else "")
+                 for r in tb.to_dict("records")] if len(tb) else []
         lines.append(f"- {label}별(분할익절): " + (", ".join(parts) or "없음"))
+    lines.append("- 돌파 점검: " + " / ".join(family_check_lines(family_check(tr, "돌파"))))
+    lines.append("- " + suggest_scan_count(tr, {"돌파"}))
     if bt["errors"]:
         lines.append(f"- 제외된 코인 {len(bt['errors'])}개: " + " / ".join(bt["errors"][:8]))
     return "\n".join(lines)

@@ -72,6 +72,7 @@ CSS = """
 .status{font-size:.82rem;font-weight:650;margin-top:4px}
 .plan{margin-top:8px;font-size:.8rem;line-height:1.5;background:rgba(59,130,246,.10);border-radius:10px;padding:6px 9px}
 .over{margin-top:6px;font-size:.78rem;color:#dc2626;font-weight:650}
+.perp{margin-top:4px;font-size:.78rem;background:rgba(245,158,11,.15);border-radius:8px;padding:4px 8px}
 .tag.ct{background:rgba(147,51,234,.18)}
 .dead{font-size:.85rem;padding:6px 2px;border-bottom:1px solid rgba(128,128,128,.2)}
 """
@@ -127,27 +128,38 @@ STATUS_INFO = {
 }
 
 
-def exit_plan_text(setup) -> str:
+def exit_plan_text(setup, scale: float = 1.0) -> str:
     """목표1 분할 익절 → 본전 손절 → 추적 손절 계획을 한 줄로."""
     from crypto_market_regime import PARTIAL_TP_FRACTION, TRAIL_ATR  # 지연 임포트
     side = side_info(setup.bias)[0]
     pct = int(round(PARTIAL_TP_FRACTION * 100))
     anchor = "최고가" if side == "long" else "최저가"
-    trail = f"{TRAIL_ATR:g} ATR(≈{fmt_price(TRAIL_ATR * setup.atr)})" if getattr(setup, "atr", 0) else f"{TRAIL_ATR:g} ATR"
+    trail = (f"{TRAIL_ATR:g} ATR(≈{fmt_price(TRAIL_ATR * setup.atr * scale)})"
+             if getattr(setup, "atr", 0) else f"{TRAIL_ATR:g} ATR")
     return f"목표1에서 {pct}% 익절 → 남은 물량 손절을 진입가로 → 이후 {anchor}에서 {trail} 되돌리면 정리"
 
 
+def perp_name(setup) -> str:
+    ps = getattr(setup, "perp_symbol", "") or ""
+    return (ps.split(":")[0] if ps else setup.symbol).replace("/", "")
+
+
 def order_memo(setup, sizing: Dict, lev: int) -> str:
+    """Bitget 선물 주문용 메모. 1000배 단위로 표기되는 선물은 가격·수량을 선물 기준으로 환산."""
     side, side_kr, sub = side_info(setup.bias)
-    return "\n".join([
-        f"{setup.symbol.replace('/', '')}  {side_kr} ({sub})",
-        f"진입(지정가): {fmt_price(setup.entry_price)}",
-        f"손절: {fmt_price(setup.sl)}",
-        f"목표1: {fmt_price(setup.tp1)}  /  목표2(참고): {fmt_price(setup.tp2)}",
-        f"청산: {exit_plan_text(setup)}",
-        f"수량: {sizing['size']:.4f}  (명목 ${fmt_money(sizing['notional'])})",
+    m = int(getattr(setup, "perp_mult", 1) or 1)
+    lines = [
+        f"{perp_name(setup)}  {side_kr} ({sub})",
+        f"진입(지정가): {fmt_price(setup.entry_price * m)}",
+        f"손절: {fmt_price(setup.sl * m)}",
+        f"목표1: {fmt_price(setup.tp1 * m)}  /  목표2(참고): {fmt_price(setup.tp2 * m)}",
+        f"청산: {exit_plan_text(setup, m)}",
+        f"수량: {sizing['size'] / m:.4f}  (명목 ${fmt_money(sizing['notional'])})",
         f"레버리지 상한 가이드: {lev}배 이하 (격리)",
-    ])
+    ]
+    if m > 1:
+        lines.append(f"※ Bitget 선물은 {m:,}배 단위 표기라 가격은 ×{m:,}, 수량은 ÷{m:,} 해서 적었어요")
+    return "\n".join(lines)
 
 
 def dead_line(setup) -> str:
@@ -195,12 +207,15 @@ def card_html(setup, sizing: Dict, risk_pct: float, over_limit: bool = False) ->
             f"손절 시 손실 ${fmt_money(sizing['risk_amount'])} (계좌의 {risk_pct:g}%)<br>"
             f"레버리지 상한 가이드 <b>{lev}배 이하</b> (격리마진)")
     plan = f'<div class="plan">🧭 청산: {e(exit_plan_text(setup))}</div>'
+    m = int(getattr(setup, "perp_mult", 1) or 1)
+    perp_note = (f'<div class="perp">Bitget 선물 표기 <b>{e(perp_name(setup))}</b> — 선물 주문 가격은 아래 값 ×{m:,} '
+                 f'(주문 메모에는 환산해서 적었어요)</div>') if m > 1 else ""
     if over_limit:
         warn += '<div class="over">⛔ 총 리스크 상한 초과 — 지금은 참고만 (보유 포지션이 정리되면 검토)</div>' 
     return (f'<div class="cc {side}">'
             f'<div class="cc-head"><span class="pill {side}">{side.upper()} {e(side_kr)}</span>'
             f'<span class="sym">{e(setup.symbol)}</span>{tags}</div>'
-            f'<div class="status">{s_icon} {e(s_label)}</div>'
+            f'<div class="status">{s_icon} {e(s_label)}</div>{perp_note}'
             f'<div class="sub">{e(sub)} · {e(stats)}</div>'
             f'<div class="grid">{grid}</div>'
             f'{plan}<div class="foot">{foot}</div>{warn}</div>')

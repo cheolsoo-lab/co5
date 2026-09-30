@@ -38,7 +38,7 @@ def kst(ts) -> str:
     return (pd.Timestamp(ts) + pd.Timedelta(hours=9)).strftime("%H:%M")
 
 
-APP_VERSION = "2026-09-30 v4"
+APP_VERSION = "2026-09-30 v5"
 st.title("📈 코인 추천")
 _engine_ver = getattr(cmr, "APP_VERSION", None)
 st.caption(f"Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님) · 버전 {APP_VERSION}")
@@ -62,22 +62,28 @@ with st.expander("⚙️ 설정"):
     max_n = st.slider("같은 방향 동시 추천 최대 개수", 1, 15, 10, key="max_n",
                       help="알트코인은 BTC와 같이 움직여서, 같은 방향을 많이 잡아도 분산이 잘 안 됩니다")
     c5, c6 = st.columns(2)
-    top_n = c5.slider("거래소별 스캔 코인 수", 10, 150, 100, key="top_n", help="바꾼 뒤 '새로 분석'을 눌러야 반영")
+    top_n = c5.slider("스캔 코인 수 (3개 거래소 합산 거래량 순위)", 10, 150, 30, key="top_n",
+                      help="과거 검증의 '거래량 구간별' 결과에서 플러스가 확인된 구간까지만 늘리세요. "
+                           "바꾼 뒤 '새로 분석'을 눌러야 반영")
     live_sec = c6.selectbox("가격 자동 갱신(초)", [15, 30, 60], index=1, key="live_sec")
     tf_choice = st.radio("신호 봉", ["4시간봉 (기본)", "1시간봉 (비교용)"], horizontal=True, key="tf_choice")
     bitget_only = st.checkbox("Bitget 선물 거래 가능한 코인만", value=True, key="bitget_only")
+    fams = st.multiselect("추천할 신호 유형", ["돌파", "추세", "박스 역매매"], default=["돌파"], key="fams",
+                          help="2년 과거 검증(4시간봉)에서 돌파만 뚜렷한 플러스였어요. 추세·박스 역매매는 "
+                               "켤 수 있지만 근거가 약해요.")
 
 tf = "1h" if tf_choice.startswith("1") else "4h"
 risk_cfg = cmr.RiskConfig(account_balance=balance, risk_per_trade_pct=risk_pct, max_concurrent_setups=max_n,
                           max_total_risk_pct=max_total, open_positions=int(open_pos))
-scan_cfg = (top_n, bitget_only, tf)
+scan_cfg = (top_n, bitget_only, tf, tuple(sorted(fams)))
 
 
 # ---------------------------------------------------------------- 과거 검증 화면
 def render_backtest() -> None:
     st.caption("실제 과거 데이터로 지금 전략을 그대로 돌려봐요. 과거에 좋았다고 미래가 보장되진 않아요.")
     b1, b2 = st.columns(2)
-    n_coins = b1.slider("검증할 코인 수", 5, 30, 15, key="bt_n")
+    n_coins = b1.slider("검증할 코인 수", 6, 30, 30, step=3, key="bt_n",
+                        help="거래량 1~30위·31~60위·61~100위에서 3분의 1씩 고르게 뽑아요")
     period = b2.selectbox("기간", ["6개월", "1년", "2년"], index=1, key="bt_period")
     days = {"6개월": 182, "1년": 365, "2년": 730}[period]
     est_min = max(1, round(n_coins * (9 if tf == "4h" else 30) * days / 365 / 60))
@@ -124,12 +130,20 @@ def render_backtest() -> None:
     cmp_line = cmr.compare_modes_line(bt)
     st.markdown("\n".join(f"- {x}" for x in lines + ([cmp_line] if cmp_line else [])))
 
-    t1, t2, t3 = st.tabs(["방향·유형별", "코인별", "📋 복사용"])
+    t1, t4, t5, t2, t3 = st.tabs(["유형·방향", "구간·변동성", "돌파 점검", "코인별", "📋 복사용"])
     tr = bt["trades"]["partial_trail"]
     with t1:
         st.caption("분할익절+추적손절 기준")
-        st.dataframe(cmr.backtest_group_table(tr, "direction"), hide_index=True, use_container_width=True)
         st.dataframe(cmr.backtest_group_table(tr, "family"), hide_index=True, use_container_width=True)
+        st.dataframe(cmr.backtest_group_table(tr, "direction"), hide_index=True, use_container_width=True)
+    with t4:
+        st.caption("거래량 구간별: 스캔 코인 수를 어디까지 늘려도 되는지 판단하는 표")
+        st.dataframe(cmr.backtest_group_table(tr, "tier"), hide_index=True, use_container_width=True)
+        st.markdown(cmr.suggest_scan_count(tr, set(fams) or None))
+        st.caption("진입 시점 변동성별(가격 대비 ATR): 변동성이 낮은 코인은 손절폭이 좁아 비용 비중이 커져요")
+        st.dataframe(cmr.backtest_group_table(tr, "vol"), hide_index=True, use_container_width=True)
+    with t5:
+        st.markdown("\n".join(f"- {x}" for x in cmr.family_check_lines(cmr.family_check(tr, "돌파"))))
     with t2:
         st.caption("분할익절+추적손절 기준 · 합계 R 순")
         st.dataframe(cmr.backtest_group_table(tr, "symbol"), hide_index=True, use_container_width=True)
@@ -163,6 +177,7 @@ def run_scan(force: bool) -> None:
             return
         cmr.TOP_N_BY_VOLUME = top_n
         cmr.BITGET_ONLY = bitget_only
+        cmr.ENABLED_FAMILIES = set(fams)
         cmr.set_timeframe(tf)
         buf = io.StringIO()
         try:
@@ -266,9 +281,11 @@ def recommendations() -> None:
         st.caption(f"🎯 새로 잡을 수 있는 포지션 {slots}개 (총 리스크 상한 {max_total:g}%, 보유 {int(open_pos)}개)")
 
     if not alive:
+        rare = " 돌파 신호는 원래 드물어서(코인 30개 기준 한 달에 몇 건 수준) 비어 있는 날이 많아요." \
+            if set(fams) == {"돌파"} else ""
         st.info("**지금은 조건에 맞는 코인이 없어요.**\n\n"
-                "추세·임펄스·상대강도·손익비·상위추세·펀딩비·스프레드 조건을 모두 통과한 코인이 없다는 뜻입니다. "
-                "억지로 진입하지 않는 것도 전략이에요. 다음 봉 마감 때 다시 확인하세요.")
+                "켜둔 신호 유형에서 손익비·상위추세·펀딩비·스프레드 조건을 모두 통과한 코인이 없다는 뜻입니다."
+                f"{rare} 억지로 진입하지 않는 것도 전략이에요.")
     else:
         tab1, tab2 = st.tabs([f"✅ 진입 검토 ({len(ready)})", f"⏳ 대기 ({len(waiting)})"])
         with tab1:
@@ -326,6 +343,8 @@ fs = res.get("filter_stats") or {}
 if fs.get("universe"):
     with st.expander(f"🧮 필터 통과 현황 ({fs.get('universe', 0)}개 → {fs.get('passed', 0)}개)"):
         st.caption("각 조건에서 몇 개가 걸러졌는지예요. 한 조건이 거의 다 걸러내거나 아무것도 못 거르면 기준 점검이 필요해요.")
+        if fs.get("universe_diag"):
+            st.caption("스캔 대상: " + ", ".join(f"{k} {v}" for k, v in fs["universe_diag"].items()))
         rows = sorted((fs.get("rejects") or {}).items(), key=lambda kv: -kv[1])
         if rows:
             st.table(pd.DataFrame([{"제외 사유": cmr.REJECT_LABELS.get(k, k), "코인 수": v} for k, v in rows]))
