@@ -48,8 +48,16 @@ st.title("📈 코인 추천")
 _engine_ver = getattr(cmr, "APP_VERSION", None)
 st.caption(f"Bitget 선물용 · 스윙 신호 · 참고용(자동 주문 아님) · 버전 {APP_VERSION}")
 if _engine_ver != APP_VERSION:
+    import glob
+    import os
+    _path = getattr(cmr, "__file__", "?")
+    _size = os.path.getsize(_path) if os.path.exists(_path) else 0
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    _similar = sorted(os.path.basename(x) for x in glob.glob(os.path.join(_dir, "*crypto_market_regime*")))
     st.error(f"⚠️ 파일 버전이 맞지 않아요. 화면(app.py)은 {APP_VERSION}인데 분석 엔진(crypto_market_regime.py)은 "
              f"{_engine_ver or '이전 버전'}이에요. crypto_market_regime.py를 새 파일로 교체하고 앱을 재시작해주세요.")
+    st.code(f"불러온 엔진 파일: {_path}\n파일 크기: {_size:,} 바이트 (새 버전은 약 196,000 바이트)\n"
+            f"app.py와 같은 폴더의 비슷한 이름 파일: {', '.join(_similar) or '없음'}", language=None)
     st.stop()
 
 # 전략 연구실에서 적용한 설정 불러오기 (저장 파일 → 한 번만), 매 실행마다 엔진에 반영
