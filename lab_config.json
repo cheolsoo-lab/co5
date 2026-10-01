@@ -1,0 +1,11 @@
+{
+ "breakout_entry": "immediate",
+ "donchian": true,
+ "priority_tags": [],
+ "filter_tags": [],
+ "tsm": false,
+ "baseline_ok": true,
+ "made_at": "2026-10-01 01:33:55.153765",
+ "version": "2026-09-30 v11",
+ "timeframe": "4h"
+}
